@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from time import perf_counter
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
@@ -524,7 +525,7 @@ class PencilRenderer:
 
 
 class DrawingGraphicsView(QGraphicsView):
-    drawing_changed = Signal(QImage)
+    drawing_changed = Signal(str, QRect, QImage, QImage)
     stroke_started = Signal(QImage)
     drawing_attempted = Signal()
 
@@ -583,6 +584,7 @@ class DrawingGraphicsView(QGraphicsView):
         self._stroke_path = QPainterPath()
         self._stroke_dot_points: list[QPointF] = []
         self._square_stroke_stamps: list[tuple[QPointF, float, float]] = []
+        self._stroke_dirty_rect = QRect()
         self._gradient_start: QPointF | None = None
         self._gradient_end = QPointF()
         self._gradient_end_color = QColor("#00000000")
@@ -776,13 +778,33 @@ class DrawingGraphicsView(QGraphicsView):
     def drawing_image_copy(self) -> QImage:
         return self._drawing_image.copy()
 
+    def apply_drawing_patch(self, rect: QRect, patch: QImage) -> None:
+        if self._drawing_image.isNull() or patch.isNull():
+            return
+        target_rect = rect.intersected(self._drawing_image.rect())
+        if target_rect.isEmpty():
+            return
+        source_rect = QRect(
+            target_rect.x() - rect.x(),
+            target_rect.y() - rect.y(),
+            target_rect.width(),
+            target_rect.height(),
+        )
+        painter = QPainter(self._drawing_image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.drawImage(target_rect.topLeft(), patch.copy(source_rect))
+        painter.end()
+        self._refresh_drawing_item()
+
     def clear_drawing(self) -> None:
         if self._drawing_image.isNull():
             return
         self._cancel_stroke_state()
+        rect = self._drawing_image.rect()
+        before_patch = self._drawing_image.copy(rect)
         self._drawing_image.fill(Qt.GlobalColor.transparent)
         self._refresh_drawing_item()
-        self.drawing_changed.emit(self._drawing_image.copy())
+        self.drawing_changed.emit("clear", rect, before_patch, self._drawing_image.copy(rect))
 
     def export_drawing_png(self, path: str) -> bool:
         if self._drawing_image.isNull():
@@ -807,7 +829,6 @@ class DrawingGraphicsView(QGraphicsView):
                     return
                 self._begin_stroke(point, self._smoothed_event_pressure(event, reset=True))
                 self._is_drawing = True
-                self.stroke_started.emit(self._drawing_image.copy())
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -834,11 +855,13 @@ class DrawingGraphicsView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        release_start = perf_counter()
         if self._is_drawing and event.button() == Qt.MouseButton.LeftButton:
             if self._drawing_tool == "gradient":
                 self._commit_gradient(
                     self._clamped_point(self._scene_point_from_viewport(event.position()))
                 )
+                self._log_release_profile(release_start, "gradient")
                 event.accept()
                 return
             self._append_input_point(
@@ -846,7 +869,7 @@ class DrawingGraphicsView(QGraphicsView):
                 pressure=self._smoothed_event_pressure(event),
                 force=True,
             )
-            self._finish_active_stroke(emit_change=True)
+            self._finish_active_stroke(emit_change=True, release_start=release_start)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -928,6 +951,7 @@ class DrawingGraphicsView(QGraphicsView):
         self._stroke_path = QPainterPath()
         self._stroke_dot_points.clear()
         self._square_stroke_stamps.clear()
+        self._stroke_dirty_rect = QRect()
         self._last_square_angle = None
         self._press_point = point
         self._waiting_for_first_motion = True
@@ -1048,6 +1072,7 @@ class DrawingGraphicsView(QGraphicsView):
             self._append_square_line_stamps(start, end, start_pressure, end_pressure)
         elif self._drawing_tool == "pencil":
             self._pencil_renderer.add_segment(start, end, start_pressure, end_pressure)
+        self._mark_stroke_dirty(start, end)
         self._stroke_has_content = True
         self._schedule_drawing_preview()
 
@@ -1063,6 +1088,7 @@ class DrawingGraphicsView(QGraphicsView):
             self._append_square_curve_stamps(start, control, end)
         elif self._drawing_tool == "pencil":
             self._pencil_renderer.add_segment(start, end, 1.0, 1.0)
+        self._mark_stroke_dirty(start, end)
         self._stroke_has_content = True
         self._schedule_drawing_preview()
 
@@ -1080,15 +1106,33 @@ class DrawingGraphicsView(QGraphicsView):
             ]
         elif self._drawing_tool == "pencil":
             self._pencil_renderer.add_dot(point, self._press_pressure)
+        self._mark_stroke_dirty(point, point)
         self._stroke_has_content = True
         self._schedule_drawing_preview()
+
+    def _mark_stroke_dirty(self, start: QPointF, end: QPointF) -> None:
+        pad = self._dirty_padding()
+        left = math.floor(min(start.x(), end.x()) - pad)
+        top = math.floor(min(start.y(), end.y()) - pad)
+        right = math.ceil(max(start.x(), end.x()) + pad)
+        bottom = math.ceil(max(start.y(), end.y()) + pad)
+        rect = QRect(left, top, max(1, right - left + 1), max(1, bottom - top + 1))
+        rect = rect.intersected(self._drawing_image.rect())
+        if rect.isEmpty():
+            return
+        self._stroke_dirty_rect = rect if self._stroke_dirty_rect.isNull() else self._stroke_dirty_rect.united(rect)
+
+    def _dirty_padding(self) -> float:
+        if self._drawing_tool == "square_brush":
+            return self._brush_size * 1.2 + 4
+        return self._brush_size / 2 + 4
 
     def _schedule_drawing_preview(self) -> None:
         self._drawing_dirty = True
         if not self._drawing_preview_timer.isActive():
             self._drawing_preview_timer.start(16)
 
-    def _finish_active_stroke(self, *, emit_change: bool) -> None:
+    def _finish_active_stroke(self, *, emit_change: bool, release_start: float | None = None) -> None:
         if self._gradient_start is not None:
             self._cancel_gradient()
             return
@@ -1108,14 +1152,41 @@ class DrawingGraphicsView(QGraphicsView):
                 )
                 self._last_draw_point = final_point
 
+        flush_start = perf_counter()
         self._flush_drawing_preview()
+        flush_ms = (perf_counter() - flush_start) * 1000
         changed = self._stroke_has_content
+        commit_ms = 0.0
+        emit_ms = 0.0
+        committed: tuple[str, QRect, QImage, QImage] | None = None
         if changed:
-            self._commit_stroke_preview()
+            commit_start = perf_counter()
+            committed = self._commit_stroke_preview()
+            commit_ms = (perf_counter() - commit_start) * 1000
         self._clear_stroke_preview_layer()
         self._reset_stroke_tracking()
-        if changed and emit_change:
-            self.drawing_changed.emit(self._drawing_image.copy())
+        if committed is not None and emit_change:
+            emit_start = perf_counter()
+            self.drawing_changed.emit(*committed)
+            emit_ms = (perf_counter() - emit_start) * 1000
+        if release_start is not None:
+            total_ms = (perf_counter() - release_start) * 1000
+            rect_text = "none"
+            if committed is not None:
+                rect = committed[1]
+                rect_text = f"{rect.width()}x{rect.height()}"
+            if total_ms >= 16.0:
+                print(
+                    "[stroke-release] "
+                    f"tool={self._drawing_tool} rect={rect_text} "
+                    f"preview_flush={flush_ms:.2f}ms stroke_commit={commit_ms:.2f}ms "
+                    f"main_window_handlers={emit_ms:.2f}ms mouseReleaseEvent={total_ms:.2f}ms"
+                )
+
+    def _log_release_profile(self, release_start: float, tool: str) -> None:
+        total_ms = (perf_counter() - release_start) * 1000
+        if total_ms >= 16.0:
+            print(f"[stroke-release] tool={tool} mouseReleaseEvent={total_ms:.2f}ms")
 
     def _paint_pending_stroke(self) -> None:
         if self._stroke_path.isEmpty() and not self._stroke_dot_points:
@@ -1180,22 +1251,26 @@ class DrawingGraphicsView(QGraphicsView):
         before = self._drawing_image.copy()
         fill_color = QColor(self._brush_color)
         fill_color.setAlpha(round(255 * self._brush_opacity))
-        if not self._flood_fill(x, y, fill_color):
+        changed_rect = self._flood_fill(x, y, fill_color)
+        if changed_rect.isNull():
             return
-        self.stroke_started.emit(before)
+        before_patch = before.copy(changed_rect)
         self._refresh_drawing_item()
-        self.drawing_changed.emit(self._drawing_image.copy())
+        self.drawing_changed.emit("bucket", changed_rect, before_patch, self._drawing_image.copy(changed_rect))
 
-    def _flood_fill(self, start_x: int, start_y: int, fill_color: QColor) -> bool:
+    def _flood_fill(self, start_x: int, start_y: int, fill_color: QColor) -> QRect:
         target = self._drawing_image.pixelColor(start_x, start_y)
         if self._colors_are_close(target, fill_color):
-            return False
+            return QRect()
 
         width = self._drawing_image.width()
         height = self._drawing_image.height()
         stack = [(start_x, start_y)]
         tolerance = 8
-        changed = False
+        left_bound = width
+        right_bound = -1
+        top_bound = height
+        bottom_bound = -1
         while stack:
             x, y = stack.pop()
             if y < 0 or y >= height or x < 0 or x >= width:
@@ -1212,7 +1287,10 @@ class DrawingGraphicsView(QGraphicsView):
 
             for fill_x in range(left, right + 1):
                 self._drawing_image.setPixelColor(fill_x, y, fill_color)
-            changed = True
+            left_bound = min(left_bound, left)
+            right_bound = max(right_bound, right)
+            top_bound = min(top_bound, y)
+            bottom_bound = max(bottom_bound, y)
 
             for neighbor_y in (y - 1, y + 1):
                 if neighbor_y < 0 or neighbor_y >= height:
@@ -1230,7 +1308,9 @@ class DrawingGraphicsView(QGraphicsView):
                         self._drawing_image.pixelColor(fill_x, neighbor_y), target, tolerance
                     ):
                         fill_x += 1
-        return changed
+        if right_bound < left_bound or bottom_bound < top_bound:
+            return QRect()
+        return QRect(left_bound, top_bound, right_bound - left_bound + 1, bottom_bound - top_bound + 1)
 
     @staticmethod
     def _colors_are_close(first: QColor, second: QColor, tolerance: int = 0) -> bool:
@@ -1282,18 +1362,18 @@ class DrawingGraphicsView(QGraphicsView):
             return
         self._gradient_end = QPointF(point)
         self._render_gradient_preview()
-        before = self._drawing_image.copy()
+        rect = self._drawing_image.rect()
+        before_patch = self._drawing_image.copy(rect)
         painter = QPainter(self._drawing_image)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         painter.setOpacity(self._brush_opacity)
         painter.drawImage(0, 0, self._stroke_preview_image)
         painter.end()
-        self.stroke_started.emit(before)
         self._refresh_drawing_item()
         self._clear_stroke_preview_layer()
         self._gradient_start = None
         self._is_drawing = False
-        self.drawing_changed.emit(self._drawing_image.copy())
+        self.drawing_changed.emit("gradient", rect, before_patch, self._drawing_image.copy(rect))
 
     def _cancel_gradient(self) -> None:
         self._gradient_start = None
@@ -1343,10 +1423,15 @@ class DrawingGraphicsView(QGraphicsView):
                 self._drawing_item.show()
         self.viewport().update()
 
-    def _commit_stroke_preview(self) -> None:
+    def _commit_stroke_preview(self) -> tuple[str, QRect, QImage, QImage] | None:
         if self._stroke_preview_image.isNull() or self._drawing_image.isNull():
-            return
+            return None
+        rect = self._stroke_dirty_rect.intersected(self._drawing_image.rect())
+        if rect.isEmpty():
+            return None
+        before_patch = self._drawing_image.copy(rect)
         painter = QPainter(self._drawing_image)
+        painter.setClipRect(rect)
         if self._drawing_tool == "eraser":
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
         else:
@@ -1355,6 +1440,7 @@ class DrawingGraphicsView(QGraphicsView):
         painter.drawImage(0, 0, self._stroke_preview_image)
         painter.end()
         self._refresh_drawing_item()
+        return self._drawing_tool, rect, before_patch, self._drawing_image.copy(rect)
 
     def _clear_stroke_preview_layer(self) -> None:
         self._stroke_preview_image = QImage()
@@ -1522,7 +1608,6 @@ class DrawingGraphicsView(QGraphicsView):
         self._drawing_preview_timer.stop()
         self._drawing_dirty = False
         self._paint_pending_stroke()
-        self._refresh_drawing_item()
 
     def _cancel_stroke_state(self) -> None:
         self._drawing_preview_timer.stop()
@@ -1549,6 +1634,7 @@ class DrawingGraphicsView(QGraphicsView):
         self._stroke_dot_points.clear()
         self._soft_renderer.reset()
         self._square_stroke_stamps.clear()
+        self._stroke_dirty_rect = QRect()
         self._pencil_renderer.reset()
         self._last_square_angle = None
         self._stroke_has_content = False

@@ -7,6 +7,7 @@ import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Callable
 
 from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QPoint, QRect, QSettings, Qt, QTimer, QSize
@@ -948,24 +949,33 @@ class FrameViewerWindow(QMainWindow):
         self._thumbnail_dirty.add(frame_index)
         for mode in ("reference", "drawing", "composite"):
             self._thumbnail_cache.pop((frame_index, mode), None)
-        self._refresh_frame_thumbnail_if_visible(frame_index)
-        self._schedule_visible_thumbnail_refresh()
+        self._schedule_visible_thumbnail_refresh(delay_ms=160)
 
     def _mark_all_thumbnails_dirty(self) -> None:
         self._thumbnail_dirty.update(range(len(self.frame_paths)))
         self._thumbnail_cache.clear()
         self._schedule_visible_thumbnail_refresh()
 
-    def _schedule_visible_thumbnail_refresh(self, *_args) -> None:
-        if not self._thumbnail_refresh_timer.isActive():
-            self._thumbnail_refresh_timer.start(0)
+    def _schedule_visible_thumbnail_refresh(self, *_args, delay_ms: int = 0) -> None:
+        delay_ms = max(0, delay_ms)
+        if self._thumbnail_refresh_timer.isActive():
+            if delay_ms > 0:
+                self._thumbnail_refresh_timer.start(delay_ms)
+            return
+        self._thumbnail_refresh_timer.start(delay_ms)
 
     def _refresh_visible_thumbnails(self) -> None:
+        refresh_start = perf_counter()
+        refreshed = 0
         visible_rect = self.timeline.viewport().rect()
         for index in range(self.timeline.count()):
             item = self.timeline.item(index)
             if self.timeline.visualItemRect(item).intersects(visible_rect):
                 self._update_timeline_item_thumbnail(index)
+                refreshed += 1
+        total_ms = (perf_counter() - refresh_start) * 1000
+        if total_ms >= 16.0:
+            print(f"[thumbnail-refresh] visible_items={refreshed} total={total_ms:.2f}ms")
 
     def _refresh_frame_thumbnail_if_visible(self, frame_index: int) -> None:
         if frame_index < 0 or frame_index >= self.timeline.count():
@@ -1308,6 +1318,8 @@ class FrameViewerWindow(QMainWindow):
 
     def set_view_mode(self, index: int) -> None:
         self.view_stack.setCurrentIndex(index)
+        if self.frame_paths and self.current_drawing_size.width() > 1 and self.current_drawing_size.height() > 1:
+            self.sync_drawing_layer_to_views()
         if self.view_stack.currentWidget() is self.float_reference_view:
             self.reference_float_window.show()
             self.reference_float_window.raise_()
@@ -1493,9 +1505,21 @@ class FrameViewerWindow(QMainWindow):
         kind = str(getattr(source, "_drawing_tool", "stroke"))
         self._pending_stroke_before[self.current_index] = (kind, image.copy())
 
-    def update_current_drawing_layer(self, image: QImage) -> None:
+    def update_current_drawing_layer(self, *args) -> None:
         if self._syncing_drawing:
             return
+        if len(args) == 4:
+            kind, rect, before_patch, after_patch = args
+            self._update_current_drawing_layer_patch(
+                str(kind),
+                QRect(rect),
+                QImage(before_patch),
+                QImage(after_patch),
+            )
+            return
+        if len(args) != 1:
+            return
+        image = args[0]
         pending = self._pending_stroke_before.pop(self.current_index, None)
         after = image.copy()
         self.drawing_layers[self.current_index] = after
@@ -1504,6 +1528,53 @@ class FrameViewerWindow(QMainWindow):
             self._commit_drawing_operation_from_images(kind, before, after)
         self.sync_drawing_layer_to_views()
         self._mark_frame_thumbnail_dirty(self.current_index)
+
+    def _update_current_drawing_layer_patch(
+        self,
+        kind: str,
+        rect: QRect,
+        before_patch: QImage,
+        after_patch: QImage,
+    ) -> None:
+        total_start = perf_counter()
+        self._pending_stroke_before.pop(self.current_index, None)
+        image = self._drawing_image_for_current_frame()
+        target_rect = rect.intersected(image.rect())
+        if target_rect.isEmpty():
+            return
+
+        apply_start = perf_counter()
+        self._apply_patch_to_image(image, rect, after_patch)
+        self.drawing_layers[self.current_index] = image
+        apply_ms = (perf_counter() - apply_start) * 1000
+
+        history_start = perf_counter()
+        self._commit_drawing_operation(
+            DrawingOperation(
+                kind=kind,
+                rect=QRect(rect),
+                before_patch=before_patch.copy(),
+                after_patch=after_patch.copy(),
+            )
+        )
+        history_ms = (perf_counter() - history_start) * 1000
+
+        refresh_start = perf_counter()
+        self._sync_drawing_patch_to_visible_views(rect, after_patch, exclude=self.sender())
+        refresh_ms = (perf_counter() - refresh_start) * 1000
+
+        thumb_start = perf_counter()
+        self._mark_frame_thumbnail_dirty(self.current_index)
+        thumbnail_ms = (perf_counter() - thumb_start) * 1000
+        total_ms = (perf_counter() - total_start) * 1000
+        if total_ms >= 8.0:
+            print(
+                "[drawing-commit] "
+                f"kind={kind} rect={target_rect.width()}x{target_rect.height()} "
+                f"patch_apply={apply_ms:.2f}ms undo_record={history_ms:.2f}ms "
+                f"canvas_refresh={refresh_ms:.2f}ms thumbnail_schedule={thumbnail_ms:.2f}ms "
+                f"handler_total={total_ms:.2f}ms"
+            )
 
     def clear_current_drawing_layer(self) -> None:
         current_image = self._drawing_image_for_current_frame().copy()
@@ -1522,7 +1593,7 @@ class FrameViewerWindow(QMainWindow):
         self._apply_drawing_operation_patch(operation, operation.before_patch)
         history.redo.append(operation)
         self._pending_stroke_before.pop(self.current_index, None)
-        self.sync_drawing_layer_to_views()
+        self._sync_drawing_patch_to_visible_views(operation.rect, operation.before_patch)
         self._mark_frame_thumbnail_dirty(self.current_index)
 
     def redo_current_frame_drawing(self) -> None:
@@ -1533,7 +1604,7 @@ class FrameViewerWindow(QMainWindow):
         self._apply_drawing_operation_patch(operation, operation.after_patch)
         history.undo.append(operation)
         self._pending_stroke_before.pop(self.current_index, None)
-        self.sync_drawing_layer_to_views()
+        self._sync_drawing_patch_to_visible_views(operation.rect, operation.after_patch)
         self._mark_frame_thumbnail_dirty(self.current_index)
 
     def _commit_drawing_operation(self, operation: DrawingOperation) -> None:
@@ -1602,12 +1673,17 @@ class FrameViewerWindow(QMainWindow):
 
     def _apply_drawing_operation_patch(self, operation: DrawingOperation, patch: QImage) -> None:
         image = self._drawing_image_for_current_frame().copy()
-        target_rect = operation.rect.intersected(image.rect())
-        if target_rect.isEmpty():
+        self._apply_patch_to_image(image, operation.rect, patch)
+        self.drawing_layers[self.current_index] = image
+
+    @staticmethod
+    def _apply_patch_to_image(image: QImage, rect: QRect, patch: QImage) -> None:
+        target_rect = rect.intersected(image.rect())
+        if target_rect.isEmpty() or patch.isNull():
             return
         source_rect = QRect(
-            target_rect.x() - operation.rect.x(),
-            target_rect.y() - operation.rect.y(),
+            target_rect.x() - rect.x(),
+            target_rect.y() - rect.y(),
             target_rect.width(),
             target_rect.height(),
         )
@@ -1615,7 +1691,16 @@ class FrameViewerWindow(QMainWindow):
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.drawImage(target_rect.topLeft(), patch.copy(source_rect))
         painter.end()
-        self.drawing_layers[self.current_index] = image
+
+    def _sync_drawing_patch_to_visible_views(self, rect: QRect, patch: QImage, *, exclude=None) -> None:
+        self._syncing_drawing = True
+        try:
+            for canvas in self.drawing_canvases:
+                if canvas is exclude or not canvas.isVisible():
+                    continue
+                canvas.apply_drawing_patch(rect, patch)
+        finally:
+            self._syncing_drawing = False
 
     def sync_drawing_layer_to_views(self) -> None:
         image = self._drawing_image_for_current_frame()
