@@ -5,7 +5,6 @@ import io
 import json
 import sys
 import zipfile
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -44,38 +43,12 @@ from PySide6.QtWidgets import (
 
 from canvas_view import BlankCanvasView, CanvasView
 from gif_loader import export_png_sequence, load_gif_frames
+from history import FrameDrawingHistory, HistoryMemoryManager, DrawingOperation
 
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_FRAME_DIR = APP_DIR / "work" / "demo_frames"
-MAX_HISTORY_OPERATIONS = 100
 PROJECT_SUFFIX = ".giftrace"
-
-
-@dataclass
-class DrawingOperation:
-    """One reversible drawing operation for a single animation frame.
-
-    Snapshot storage keeps the current stroke and clear operations simple;
-    later operation kinds can add metadata without changing history handling.
-    """
-
-    kind: str
-    before: QImage
-    after: QImage
-    metadata: dict[str, object] = field(default_factory=dict)
-
-
-@dataclass
-class FrameDrawingHistory:
-    undo: list[DrawingOperation] = field(default_factory=list)
-    redo: list[DrawingOperation] = field(default_factory=list)
-
-    def commit(self, operation: DrawingOperation) -> None:
-        self.undo.append(operation)
-        if len(self.undo) > MAX_HISTORY_OPERATIONS:
-            del self.undo[0]
-        self.redo.clear()
 
 
 def ensure_demo_png_sequence(frame_dir: Path, count: int = 12) -> list[Path]:
@@ -306,7 +279,8 @@ class FrameViewerWindow(QMainWindow):
         self.current_drawing_size = QSize(1, 1)
         self.drawing_layers: dict[int, QImage] = {}
         self.frame_histories: dict[int, FrameDrawingHistory] = {}
-        self._pending_stroke_before: dict[int, QImage] = {}
+        self._history_memory = HistoryMemoryManager()
+        self._pending_stroke_before: dict[int, tuple[str, QImage]] = {}
         self._syncing_drawing = False
         self._settings = QSettings("GIF Reference Tracing Viewer", "GIF Reference Tracing Viewer")
         self.thumbnail_display_mode = str(self._settings.value("thumbnail_display_mode", "composite"))
@@ -1079,6 +1053,7 @@ class FrameViewerWindow(QMainWindow):
         self._project_reference_images.clear()
         self.drawing_layers.clear()
         self.frame_histories.clear()
+        self._history_memory.reset()
         self._pending_stroke_before.clear()
 
         self._load_timeline()
@@ -1208,6 +1183,7 @@ class FrameViewerWindow(QMainWindow):
         self.frame_durations = durations
         self.drawing_layers = drawing_layers
         self.frame_histories.clear()
+        self._history_memory.reset()
         self._pending_stroke_before.clear()
         self.current_index = saved_index
         self.practice_scale_combo.blockSignals(True)
@@ -1510,21 +1486,22 @@ class FrameViewerWindow(QMainWindow):
             canvas.set_brush_size(size)
 
     def begin_drawing_operation(self, image: QImage) -> None:
-        """Capture the canvas once when a new pen or eraser stroke begins."""
+        """Capture the pre-change image until the current drawing operation commits."""
         if self._syncing_drawing:
             return
-        self._pending_stroke_before[self.current_index] = image.copy()
+        source = self.sender()
+        kind = str(getattr(source, "_drawing_tool", "stroke"))
+        self._pending_stroke_before[self.current_index] = (kind, image.copy())
 
     def update_current_drawing_layer(self, image: QImage) -> None:
         if self._syncing_drawing:
             return
-        before = self._pending_stroke_before.pop(self.current_index, None)
+        pending = self._pending_stroke_before.pop(self.current_index, None)
         after = image.copy()
         self.drawing_layers[self.current_index] = after
-        if before is not None:
-            self._commit_drawing_operation(
-                DrawingOperation("stroke", before=before, after=after.copy())
-            )
+        if pending is not None:
+            kind, before = pending
+            self._commit_drawing_operation_from_images(kind, before, after)
         self.sync_drawing_layer_to_views()
         self._mark_frame_thumbnail_dirty(self.current_index)
 
@@ -1533,9 +1510,7 @@ class FrameViewerWindow(QMainWindow):
         blank = self._new_blank_drawing_image(self.current_drawing_size)
         self.drawing_layers[self.current_index] = blank
         self._pending_stroke_before.pop(self.current_index, None)
-        self._commit_drawing_operation(
-            DrawingOperation("clear", before=current_image, after=blank.copy())
-        )
+        self._commit_drawing_operation_from_images("clear", current_image, blank)
         self.sync_drawing_layer_to_views()
         self._mark_frame_thumbnail_dirty(self.current_index)
 
@@ -1544,7 +1519,7 @@ class FrameViewerWindow(QMainWindow):
         if history is None or not history.undo:
             return
         operation = history.undo.pop()
-        self.drawing_layers[self.current_index] = operation.before.copy()
+        self._apply_drawing_operation_patch(operation, operation.before_patch)
         history.redo.append(operation)
         self._pending_stroke_before.pop(self.current_index, None)
         self.sync_drawing_layer_to_views()
@@ -1555,7 +1530,7 @@ class FrameViewerWindow(QMainWindow):
         if history is None or not history.redo:
             return
         operation = history.redo.pop()
-        self.drawing_layers[self.current_index] = operation.after.copy()
+        self._apply_drawing_operation_patch(operation, operation.after_patch)
         history.undo.append(operation)
         self._pending_stroke_before.pop(self.current_index, None)
         self.sync_drawing_layer_to_views()
@@ -1563,7 +1538,84 @@ class FrameViewerWindow(QMainWindow):
 
     def _commit_drawing_operation(self, operation: DrawingOperation) -> None:
         history = self.frame_histories.setdefault(self.current_index, FrameDrawingHistory())
-        history.commit(operation)
+        self._history_memory.commit(
+            self.current_index,
+            history,
+            operation,
+            self.frame_histories,
+        )
+
+    def _commit_drawing_operation_from_images(self, kind: str, before: QImage, after: QImage) -> None:
+        operation = self._drawing_operation_from_images(kind, before, after)
+        if operation is not None:
+            self._commit_drawing_operation(operation)
+
+    @staticmethod
+    def _drawing_operation_from_images(
+        kind: str,
+        before: QImage,
+        after: QImage,
+    ) -> DrawingOperation | None:
+        before = before.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        after = after.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        rect = FrameViewerWindow._changed_image_rect(before, after)
+        if rect.isNull():
+            return None
+        return DrawingOperation(
+            kind=kind,
+            rect=rect,
+            before_patch=before.copy(rect),
+            after_patch=after.copy(rect),
+        )
+
+    @staticmethod
+    def _changed_image_rect(before: QImage, after: QImage) -> QRect:
+        if before.isNull() or after.isNull() or before.size() != after.size():
+            return after.rect()
+
+        width = after.width()
+        height = after.height()
+        before_bits = before.constBits()
+        after_bits = after.constBits()
+        stride = after.bytesPerLine()
+        left = width
+        right = -1
+        top = height
+        bottom = -1
+        for y in range(height):
+            row_start = y * stride
+            row_end = row_start + width * 4
+            if before_bits[row_start:row_end] == after_bits[row_start:row_end]:
+                continue
+            top = min(top, y)
+            bottom = y
+            for x in range(width):
+                pixel_start = row_start + x * 4
+                pixel_end = pixel_start + 4
+                if before_bits[pixel_start:pixel_end] != after_bits[pixel_start:pixel_end]:
+                    left = min(left, x)
+                    right = max(right, x)
+
+        if right < left or bottom < top:
+            return QRect()
+        return QRect(left, top, right - left + 1, bottom - top + 1)
+
+    def _apply_drawing_operation_patch(self, operation: DrawingOperation, patch: QImage) -> None:
+        image = self._drawing_image_for_current_frame().copy()
+        target_rect = operation.rect.intersected(image.rect())
+        if target_rect.isEmpty():
+            return
+        source_rect = QRect(
+            target_rect.x() - operation.rect.x(),
+            target_rect.y() - operation.rect.y(),
+            target_rect.width(),
+            target_rect.height(),
+        )
+        painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.drawImage(target_rect.topLeft(), patch.copy(source_rect))
+        painter.end()
+        self.drawing_layers[self.current_index] = image
 
     def sync_drawing_layer_to_views(self) -> None:
         image = self._drawing_image_for_current_frame()
@@ -1659,15 +1711,43 @@ class FrameViewerWindow(QMainWindow):
         if image.size() == self.current_drawing_size:
             return
 
+        old_size = image.size()
         self.drawing_layers[self.current_index] = self._resized_drawing_image(image)
         history = self.frame_histories.get(self.current_index)
         if history is not None:
             for operation in [*history.undo, *history.redo]:
-                operation.before = self._resized_drawing_image(operation.before)
-                operation.after = self._resized_drawing_image(operation.after)
+                self._resize_drawing_operation(operation, old_size, self.current_drawing_size)
+            self._history_memory.recalculate(self.frame_histories)
         pending = self._pending_stroke_before.get(self.current_index)
         if pending is not None:
-            self._pending_stroke_before[self.current_index] = self._resized_drawing_image(pending)
+            kind, before = pending
+            self._pending_stroke_before[self.current_index] = (kind, self._resized_drawing_image(before))
+
+    @staticmethod
+    def _resize_drawing_operation(
+        operation: DrawingOperation,
+        old_size: QSize,
+        new_size: QSize,
+    ) -> None:
+        if old_size.isEmpty() or new_size.isEmpty():
+            return
+        scale_x = new_size.width() / old_size.width()
+        scale_y = new_size.height() / old_size.height()
+        old_rect = operation.rect
+        left = round(old_rect.x() * scale_x)
+        top = round(old_rect.y() * scale_y)
+        right = round((old_rect.x() + old_rect.width()) * scale_x)
+        bottom = round((old_rect.y() + old_rect.height()) * scale_y)
+        rect = QRect(left, top, max(1, right - left), max(1, bottom - top)).intersected(QRect(QPoint(), new_size))
+        if rect.isEmpty():
+            return
+        operation.rect = rect
+        operation.before_patch = operation.before_patch.scaled(
+            rect.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        operation.after_patch = operation.after_patch.scaled(
+            rect.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
 
     def _resized_drawing_image(self, image: QImage) -> QImage:
         resized = self._new_blank_drawing_image(self.current_drawing_size)
