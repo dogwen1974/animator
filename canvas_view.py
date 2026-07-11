@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QWidget
 
 
@@ -49,6 +49,480 @@ def _draw_scene_grid(
     painter.restore()
 
 
+class SoftBrushRenderer:
+    """Rasterize one soft brush stroke into a maximum-coverage alpha mask.
+
+    Each input segment is a variable-radius capsule.  Unlike a sequence of
+    semi-transparent dabs, softRound keeps the largest coverage at each pixel,
+    so event density and overlapping samples cannot darken one stroke.
+    """
+
+    def __init__(self) -> None:
+        self._mask = QImage()
+        self._target_size = QSize()
+        self._dirty_rect = QRect()
+        self._size = 1.0
+        self._hardness = 0.45
+        self._edge_gamma = 1.5
+        self._flow = 0.25
+        self._mode = "softRound"
+        self._last_render_key: tuple[int, bool] | None = None
+        self.raw_points: list[QPointF] = []
+        self.resampled_points: list[QPointF] = []
+        self.capsules: list[tuple[QPointF, QPointF, float, float]] = []
+
+    @property
+    def mask(self) -> QImage:
+        return self._mask
+
+    def begin(
+        self,
+        size: float,
+        hardness: int,
+        edge_gamma: float,
+        flow: float,
+        mode: str,
+        start_point: QPointF,
+    ) -> None:
+        self._size = max(1.0, float(size))
+        self._hardness = max(0.0, min(1.0, hardness / 100.0))
+        self._edge_gamma = max(0.1, float(edge_gamma))
+        self._flow = max(0.01, min(1.0, float(flow)))
+        self._mode = "airbrush" if mode == "airbrush" else "softRound"
+        self._mask = QImage()
+        self._dirty_rect = QRect()
+        self._last_render_key = None
+        self.raw_points = [QPointF(start_point)]
+        self.resampled_points = []
+        self.capsules = []
+
+    def reset(self) -> None:
+        self._mask = QImage()
+        self._dirty_rect = QRect()
+        self._last_render_key = None
+        self.raw_points = []
+        self.resampled_points = []
+        self.capsules = []
+
+    def add_raw_point(self, point: QPointF) -> None:
+        if not self.raw_points or not self._same_point(self.raw_points[-1], point):
+            self.raw_points.append(QPointF(point))
+
+    def add_capsule(
+        self,
+        start: QPointF,
+        end: QPointF,
+        start_radius: float | None = None,
+        end_radius: float | None = None,
+        start_strength: float = 1.0,
+        end_strength: float = 1.0,
+    ) -> None:
+        start_radius = max(0.5, start_radius if start_radius is not None else self._size / 2)
+        end_radius = max(0.5, end_radius if end_radius is not None else self._size / 2)
+        self._ensure_mask()
+        self._rasterize_capsule(start, end, start_radius, end_radius, start_strength, end_strength)
+        self.capsules.append((QPointF(start), QPointF(end), start_radius, end_radius))
+        if not self.resampled_points:
+            self.resampled_points.append(QPointF(start))
+        if not self._same_point(self.resampled_points[-1], end):
+            self.resampled_points.append(QPointF(end))
+
+    def add_dot(self, point: QPointF, radius: float | None = None, strength: float = 1.0) -> None:
+        self.add_capsule(point, point, radius, radius, strength, strength)
+
+    def render_colored(self, target: QImage, color: QColor, *, mask_only: bool = False) -> None:
+        if self._mask.isNull():
+            return
+        render_key = (color.rgba(), mask_only)
+        if render_key != self._last_render_key:
+            self._dirty_rect = target.rect()
+            self._last_render_key = render_key
+        rect = self._dirty_rect.intersected(target.rect())
+        if rect.isEmpty():
+            return
+        painter = QPainter(target)
+        painter.setClipRect(rect)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(rect, Qt.GlobalColor.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.fillRect(rect, Qt.GlobalColor.white if mask_only else color)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        painter.drawImage(0, 0, self._mask)
+        painter.end()
+        self._dirty_rect = QRect()
+
+    def draw_debug(self, painter: QPainter, mode: str) -> None:
+        if mode == "raw" and self.raw_points:
+            painter.save()
+            painter.setPen(QPen(QColor("#ef4444"), 0))
+            painter.setBrush(QColor("#ef4444"))
+            for point in self.raw_points:
+                painter.drawEllipse(point, 1.8, 1.8)
+            painter.restore()
+        elif mode == "resampled" and len(self.resampled_points) > 1:
+            painter.save()
+            painter.setPen(QPen(QColor("#2563eb"), 0))
+            for start, end in zip(self.resampled_points, self.resampled_points[1:]):
+                painter.drawLine(start, end)
+            painter.restore()
+        elif mode == "capsules":
+            painter.save()
+            painter.setPen(QPen(QColor(22, 163, 74, 210), 0))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for start, end, start_radius, end_radius in self.capsules:
+                painter.drawLine(start, end)
+                painter.drawEllipse(start, start_radius, start_radius)
+                painter.drawEllipse(end, end_radius, end_radius)
+            painter.restore()
+
+    def _ensure_mask(self) -> None:
+        if not self._mask.isNull():
+            return
+        # The drawing layer is the logical canvas's real pixel buffer.  Keeping
+        # the mask at this size avoids low-resolution blur and DPR resampling.
+        self._mask = QImage(self._canvas_size, QImage.Format.Format_Alpha8)
+        self._mask.fill(0)
+
+    @property
+    def _canvas_size(self) -> QSize:
+        return self._target_size
+
+    def set_canvas_size(self, size: QSize) -> None:
+        self._target_size = QSize(size)
+
+    def _rasterize_capsule(
+        self,
+        start: QPointF,
+        end: QPointF,
+        start_radius: float,
+        end_radius: float,
+        start_strength: float,
+        end_strength: float,
+    ) -> None:
+        if self._mask.isNull():
+            return
+        radius = max(start_radius, end_radius)
+        left = max(0, math.floor(min(start.x(), end.x()) - radius - 1))
+        right = min(self._mask.width() - 1, math.ceil(max(start.x(), end.x()) + radius + 1))
+        top = max(0, math.floor(min(start.y(), end.y()) - radius - 1))
+        bottom = min(self._mask.height() - 1, math.ceil(max(start.y(), end.y()) + radius + 1))
+        if left > right or top > bottom:
+            return
+
+        dx = end.x() - start.x()
+        dy = end.y() - start.y()
+        length_squared = dx * dx + dy * dy
+        for y in range(top, bottom + 1):
+            row = self._mask.scanLine(y)
+            py = y + 0.5
+            for x in range(left, right + 1):
+                px = x + 0.5
+                if length_squared <= 1e-9:
+                    t = 0.0
+                    center_x, center_y = start.x(), start.y()
+                else:
+                    t = max(0.0, min(1.0, ((px - start.x()) * dx + (py - start.y()) * dy) / length_squared))
+                    center_x = start.x() + dx * t
+                    center_y = start.y() + dy * t
+                current_radius = start_radius + (end_radius - start_radius) * t
+                strength = start_strength + (end_strength - start_strength) * t
+                distance = math.hypot(px - center_x, py - center_y)
+                coverage = self._coverage(distance, current_radius) * max(0.0, min(1.0, strength))
+                if coverage <= 0.0:
+                    continue
+                previous = row[x]
+                if self._mode == "airbrush":
+                    incoming = round(255 * coverage * self._flow)
+                    alpha = 255 - ((255 - previous) * (255 - incoming) // 255)
+                else:
+                    alpha = max(previous, round(255 * coverage))
+                if alpha > previous:
+                    row[x] = alpha
+
+        rect = QRect(left, top, right - left + 1, bottom - top + 1)
+        self._dirty_rect = rect if self._dirty_rect.isNull() else self._dirty_rect.united(rect)
+
+    def _coverage(self, distance: float, radius: float) -> float:
+        if distance >= radius:
+            return 0.0
+        # Bias low hardness toward a very small core, leaving most of the radius
+        # for a continuous feather instead of a semi-transparent hard edge.
+        inner_radius = radius * (self._hardness ** 1.35)
+        if distance <= inner_radius or radius - inner_radius <= 1e-6:
+            return 1.0
+        progress = (distance - inner_radius) / (radius - inner_radius)
+        smoothstep = progress * progress * (3.0 - 2.0 * progress)
+        return max(0.0, min(1.0, (1.0 - smoothstep) ** self._edge_gamma))
+
+    @staticmethod
+    def _same_point(first: QPointF, second: QPointF) -> bool:
+        return abs(first.x() - second.x()) < 0.01 and abs(first.y() - second.y()) < 0.01
+
+
+class PencilRenderer:
+    """Textured graphite deposition for one pencil stroke.
+
+    The renderer owns a grayscale alpha mask rather than borrowing the hard
+    brush path.  Cached material tips carry deterministic multi-scale grain;
+    each stamped placement varies continuously with travelled distance.
+    """
+
+    def __init__(self) -> None:
+        self._mask = QImage()
+        self._target_size = QSize()
+        self._dirty_rect = QRect()
+        self._last_render_key: tuple[int, bool] | None = None
+        self._tip_cache: dict[tuple[int, int, int, int], QImage] = {}
+        self._size = 4.0
+        self._grain = 55
+        self._density = 0.68
+        self._pressure_size = True
+        self._pressure_density = True
+        self._tip_variation = 0.2
+        self._distance = 0.0
+        self._smoothed_point: QPointF | None = None
+
+    def set_canvas_size(self, size: QSize) -> None:
+        self._target_size = QSize(size)
+
+    def begin(
+        self,
+        size: float,
+        grain: int,
+        density: float,
+        pressure_size: bool,
+        pressure_density: bool,
+        tip_variation: float,
+    ) -> None:
+        self._size = max(1.0, float(size))
+        self._grain = max(0, min(100, int(grain)))
+        self._density = max(0.05, min(1.0, float(density)))
+        self._pressure_size = pressure_size
+        self._pressure_density = pressure_density
+        self._tip_variation = max(0.0, min(1.0, float(tip_variation)))
+        self._mask = QImage()
+        self._dirty_rect = QRect()
+        self._last_render_key = None
+        self._distance = 0.0
+        self._smoothed_point = None
+
+    def reset(self) -> None:
+        self._mask = QImage()
+        self._dirty_rect = QRect()
+        self._last_render_key = None
+        self._distance = 0.0
+        self._smoothed_point = None
+
+    def clear_tip_cache(self) -> None:
+        self._tip_cache.clear()
+
+    def add_segment(
+        self,
+        start: QPointF,
+        end: QPointF,
+        start_pressure: float,
+        end_pressure: float,
+    ) -> None:
+        # Smooth the already de-duplicated input very lightly, then sample by
+        # arc length. This hides event-boundary kinks without changing the path.
+        raw_length = math.hypot(end.x() - start.x(), end.y() - start.y())
+        if raw_length > max(3.0, self._size * 0.5):
+            smooth_start = QPointF(start)
+            smooth_end = QPointF(end)
+        else:
+            smooth_start = QPointF(start) if self._smoothed_point is None else QPointF(self._smoothed_point)
+            smoothing = 0.74
+            smooth_end = QPointF(
+                smooth_start.x() + (end.x() - smooth_start.x()) * smoothing,
+                smooth_start.y() + (end.y() - smooth_start.y()) * smoothing,
+            )
+        self._smoothed_point = QPointF(smooth_end)
+        start = smooth_start
+        end = smooth_end
+        length = math.hypot(end.x() - start.x(), end.y() - start.y())
+        if length <= 0.001:
+            return
+        # Dense, arc-length based samples keep the graphite material continuous
+        # regardless of how sparsely the input device delivers move events.
+        spacing = max(0.18, self._size * 0.055)
+        steps = max(1, math.ceil(length / spacing))
+        tangent = math.atan2(end.y() - start.y(), end.x() - start.x())
+        previous_point: QPointF | None = None
+        previous_pressure = start_pressure
+        previous_phase = self._distance
+        for step in range(steps + 1):
+            t = step / steps
+            point = QPointF(
+                start.x() + (end.x() - start.x()) * t,
+                start.y() + (end.y() - start.y()) * t,
+            )
+            pressure = start_pressure + (end_pressure - start_pressure) * t
+            phase = self._distance + length * t
+            if previous_point is not None:
+                self._deposit_bridge(
+                    previous_point,
+                    point,
+                    previous_pressure,
+                    pressure,
+                    previous_phase,
+                    phase,
+                )
+            self._stamp(point, tangent, pressure, phase)
+            previous_point = point
+            previous_pressure = pressure
+            previous_phase = phase
+        self._distance += length
+
+    def add_dot(self, point: QPointF, pressure: float) -> None:
+        self._stamp(point, 0.0, pressure, self._distance)
+
+    def _tip_parameters(self, pressure: float) -> tuple[float, float]:
+        pressure = max(0.05, min(1.0, pressure))
+        size_scale = 0.45 + 0.55 * pressure if self._pressure_size else 1.0
+        density_scale = 0.28 + 0.72 * pressure if self._pressure_density else 1.0
+        return (
+            max(1.0, self._size * size_scale),
+            max(0.04, min(1.0, self._density * density_scale)),
+        )
+
+    def _deposit_bridge(
+        self,
+        start: QPointF,
+        end: QPointF,
+        start_pressure: float,
+        end_pressure: float,
+        start_phase: float,
+        end_phase: float,
+    ) -> None:
+        self._ensure_mask()
+        if self._mask.isNull():
+            return
+        start_diameter, start_density = self._tip_parameters(start_pressure)
+        end_diameter, end_density = self._tip_parameters(end_pressure)
+        midpoint_density = (start_density + end_density) / 2
+        midpoint_diameter = (start_diameter + end_diameter) / 2
+        phase_strength = 0.92 + 0.08 * math.sin((start_phase + end_phase) * 0.04)
+        alpha = round(255 * (0.05 + midpoint_density * 0.17) * phase_strength)
+        width = max(0.7, midpoint_diameter * (0.30 + 0.10 * midpoint_density))
+
+        painter = QPainter(self._mask)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Lighten)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(
+            QPen(
+                QColor(255, 255, 255, max(1, min(255, alpha))),
+                width,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+        )
+        painter.drawLine(start, end)
+        painter.end()
+
+        radius = max(start_diameter, end_diameter) / 2 + 2
+        self._mark_segment_dirty(start, end, radius)
+
+    def render_colored(self, target: QImage, color: QColor) -> None:
+        if self._mask.isNull():
+            return
+        render_key = (color.rgba(), False)
+        if render_key != self._last_render_key:
+            self._dirty_rect = target.rect()
+            self._last_render_key = render_key
+        rect = self._dirty_rect.intersected(target.rect())
+        if rect.isEmpty():
+            return
+        painter = QPainter(target)
+        painter.setClipRect(rect)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(rect, Qt.GlobalColor.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.fillRect(rect, color)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        painter.drawImage(0, 0, self._mask)
+        painter.end()
+        self._dirty_rect = QRect()
+
+    def _ensure_mask(self) -> None:
+        if not self._mask.isNull():
+            return
+        self._mask = QImage(self._target_size, QImage.Format.Format_ARGB32_Premultiplied)
+        self._mask.fill(Qt.GlobalColor.transparent)
+
+    def _stamp(self, point: QPointF, tangent: float, pressure: float, phase: float) -> None:
+        self._ensure_mask()
+        if self._mask.isNull():
+            return
+        diameter, density = self._tip_parameters(pressure)
+        tip = self._material_tip(diameter, density)
+
+        phase_angle = math.sin(phase * 0.055) * self._tip_variation * 0.16
+        phase_offset = math.sin(phase * 0.083 + 1.7) * self._tip_variation * diameter * 0.06
+        normal_x = -math.sin(tangent)
+        normal_y = math.cos(tangent)
+        center = QPointF(point.x() + normal_x * phase_offset, point.y() + normal_y * phase_offset)
+        logical_width = tip.width() / tip.devicePixelRatio()
+        logical_height = tip.height() / tip.devicePixelRatio()
+
+        painter = QPainter(self._mask)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Lighten)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.save()
+        painter.translate(center)
+        painter.rotate(math.degrees(phase_angle))
+        painter.drawImage(QPointF(-logical_width / 2, -logical_height / 2), tip)
+        painter.restore()
+        painter.end()
+
+        self._mark_segment_dirty(center, center, max(logical_width, logical_height) / 2 + 2)
+
+    def _mark_segment_dirty(self, start: QPointF, end: QPointF, radius: float) -> None:
+        left = max(0, math.floor(min(start.x(), end.x()) - radius))
+        top = max(0, math.floor(min(start.y(), end.y()) - radius))
+        right = min(self._mask.width(), math.ceil(max(start.x(), end.x()) + radius))
+        bottom = min(self._mask.height(), math.ceil(max(start.y(), end.y()) + radius))
+        rect = QRect(left, top, max(0, right - left), max(0, bottom - top))
+        if not rect.isEmpty():
+            self._dirty_rect = rect if self._dirty_rect.isNull() else self._dirty_rect.united(rect)
+
+    def _material_tip(self, diameter: float, density: float) -> QImage:
+        dpr = 1.0
+        size_key = max(2, round(diameter * dpr))
+        density_key = max(1, min(20, round(density * 20)))
+        key = (size_key, self._grain, density_key, round(dpr * 100))
+        cached = self._tip_cache.get(key)
+        if cached is not None:
+            return cached
+
+        image = QImage(size_key, size_key, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        radius = size_key / 2
+        grain = self._grain / 100
+        effective_density = density_key / 20
+        for y in range(size_key):
+            for x in range(size_key):
+                dx = x + 0.5 - radius
+                dy = y + 0.5 - radius
+                normalized = math.hypot(dx, dy) / max(0.001, radius)
+                if normalized >= 1.0:
+                    continue
+                edge = 1.0 - normalized
+                edge = edge * edge * (3.0 - 2.0 * edge)
+                coarse = 0.5 + 0.5 * math.sin(x * 0.71 + y * 1.19 + math.sin(x * 0.13))
+                medium = 0.5 + 0.5 * math.sin(x * 2.37 - y * 1.61 + 0.9)
+                fine = 0.5 + 0.5 * math.sin(x * 7.17 + y * 5.31 + math.sin(y * 0.49))
+                graphite = 0.58 + (coarse - 0.5) * 0.20 * grain + (medium - 0.5) * 0.36 * grain
+                porosity = effective_density - (fine - 0.5) * grain * 0.62
+                deposit = max(0.0, min(1.0, porosity * 1.55))
+                alpha = round(255 * edge * graphite * deposit)
+                if alpha:
+                    image.setPixelColor(x, y, QColor(255, 255, 255, alpha))
+        image.setDevicePixelRatio(dpr)
+        self._tip_cache[key] = image
+        return image
+
+
 class DrawingGraphicsView(QGraphicsView):
     drawing_changed = Signal(QImage)
     stroke_started = Signal(QImage)
@@ -64,23 +538,41 @@ class DrawingGraphicsView(QGraphicsView):
         self._drawing_next_source_pixmap = QPixmap()
         self._drawing_image = QImage()
         self._stroke_preview_image = QImage()
-        self._soft_stroke_mask = QImage()
         self._square_stroke_mask = QImage()
         self._drawing_enabled = False
         self._drawing_blocked = False
         self._drawing_tool = "brush"
         self._brush_color = QColor("#000000")
         self._brush_opacity = 1.0
-        self._brush_hardness = 45
+        self._brush_hardness = 20
         self._brush_size = 4
-        self._soft_tip_cache: dict[tuple[int, int, int], QImage] = {}
+        self._soft_edge_gamma = 0.75
+        self._soft_flow = 0.25
+        self._soft_renderer_mode = "softRound"
+        self._soft_debug_mode = "off"
+        self._soft_pressure_size = True
+        self._soft_pressure_opacity = False
+        self._soft_renderer = SoftBrushRenderer()
         self._square_tip_cache: dict[tuple[int, int], QImage] = {}
-        self._square_brush_follow_path = False
+        self._pencil_grain = 55
+        self._pencil_density = 68
+        self._pencil_pressure_size = True
+        self._pencil_pressure_density = True
+        self._pencil_tip_variation = 20
+        self._pencil_renderer = PencilRenderer()
+        self._square_brush_follow_path = True
         self._square_brush_fixed_angle = math.radians(45)
+        self._square_pressure_size_enabled = True
+        self._square_pressure_size_strength = 0.22
+        self._square_min_pressure_size = 0.72
         self._last_square_angle: float | None = None
         self._is_drawing = False
         self._last_draw_point = QPointF()
         self._last_input_point = QPointF()
+        self._last_draw_pressure = 1.0
+        self._last_input_pressure = 1.0
+        self._press_pressure = 1.0
+        self._filtered_pressure = 1.0
         self._previous_point = QPointF()
         self._midpoint = QPointF()
         self._control_point = QPointF()
@@ -90,8 +582,10 @@ class DrawingGraphicsView(QGraphicsView):
         self._stroke_points: list[QPointF] = []
         self._stroke_path = QPainterPath()
         self._stroke_dot_points: list[QPointF] = []
-        self._soft_stroke_points: list[QPointF] = []
-        self._square_stroke_stamps: list[tuple[QPointF, float]] = []
+        self._square_stroke_stamps: list[tuple[QPointF, float, float]] = []
+        self._gradient_start: QPointF | None = None
+        self._gradient_end = QPointF()
+        self._gradient_end_color = QColor("#00000000")
         self._stroke_has_content = False
         self._cursor_scene_pos: QPointF | None = None
         self._cursor_in_bounds = False
@@ -172,8 +666,9 @@ class DrawingGraphicsView(QGraphicsView):
         self.viewport().update()
 
     def set_drawing_tool(self, tool: str) -> None:
-        if tool in ("brush", "soft_brush", "square_brush", "eraser"):
+        if tool in ("brush", "soft_brush", "square_brush", "pencil", "eraser", "bucket", "gradient"):
             self._finish_active_stroke(emit_change=True)
+            self._cancel_gradient()
             self._drawing_tool = tool
             self.viewport().update()
 
@@ -193,6 +688,63 @@ class DrawingGraphicsView(QGraphicsView):
 
     def set_brush_hardness(self, hardness: int) -> None:
         self._brush_hardness = max(0, min(100, hardness))
+        self.viewport().update()
+
+    def set_soft_edge_gamma(self, gamma: float) -> None:
+        self._soft_edge_gamma = max(0.1, min(8.0, float(gamma)))
+        self.viewport().update()
+
+    def set_soft_flow(self, flow: float) -> None:
+        self._soft_flow = max(0.01, min(1.0, float(flow)))
+        self.viewport().update()
+
+    def set_soft_renderer_mode(self, mode: str) -> None:
+        self._finish_active_stroke(emit_change=True)
+        self._soft_renderer_mode = "airbrush" if mode == "airbrush" else "softRound"
+        self.viewport().update()
+
+    def set_soft_debug_mode(self, mode: str) -> None:
+        self._soft_debug_mode = mode
+        self.viewport().update()
+
+    def set_soft_pressure_size_enabled(self, enabled: bool) -> None:
+        self._soft_pressure_size = enabled
+
+    def set_soft_pressure_opacity_enabled(self, enabled: bool) -> None:
+        self._soft_pressure_opacity = enabled
+
+    def set_square_pressure_size_enabled(self, enabled: bool) -> None:
+        self._square_pressure_size_enabled = enabled
+
+    def set_square_pressure_size_strength(self, strength: float) -> None:
+        self._square_pressure_size_strength = max(0.0, min(0.5, float(strength)))
+
+    def set_square_min_pressure_size(self, minimum: float) -> None:
+        self._square_min_pressure_size = max(0.3, min(1.0, float(minimum)))
+
+    def set_pencil_grain(self, grain: int) -> None:
+        self._pencil_grain = max(0, min(100, int(grain)))
+        self._pencil_renderer.clear_tip_cache()
+        self.viewport().update()
+
+    def set_pencil_density(self, density: int) -> None:
+        self._pencil_density = max(5, min(100, int(density)))
+        self.viewport().update()
+
+    def set_pencil_pressure_size_enabled(self, enabled: bool) -> None:
+        self._pencil_pressure_size = enabled
+        self.viewport().update()
+
+    def set_pencil_pressure_density_enabled(self, enabled: bool) -> None:
+        self._pencil_pressure_density = enabled
+        self.viewport().update()
+
+    def set_pencil_tip_variation(self, variation: int) -> None:
+        self._pencil_tip_variation = max(0, min(100, int(variation)))
+        self.viewport().update()
+
+    def set_gradient_end_color(self, color: QColor | str) -> None:
+        self._gradient_end_color = QColor(color)
         self.viewport().update()
 
     def set_square_brush_angle_mode(self, follow_path: bool) -> None:
@@ -244,7 +796,16 @@ class DrawingGraphicsView(QGraphicsView):
         if self._should_handle_drawing(event):
             scene_pos = self._scene_point_from_viewport(event.position())
             if self._drawing_bounds_rect().contains(scene_pos):
-                self._begin_stroke(self._clamped_point(scene_pos))
+                point = self._clamped_point(scene_pos)
+                if self._drawing_tool == "bucket":
+                    self._apply_bucket(point)
+                    event.accept()
+                    return
+                if self._drawing_tool == "gradient":
+                    self._begin_gradient(point)
+                    event.accept()
+                    return
+                self._begin_stroke(point, self._smoothed_event_pressure(event, reset=True))
                 self._is_drawing = True
                 self.stroke_started.emit(self._drawing_image.copy())
                 event.accept()
@@ -254,6 +815,12 @@ class DrawingGraphicsView(QGraphicsView):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         self._update_drawing_cursor(event.position())
         if self._is_drawing:
+            if self._drawing_tool == "gradient":
+                self._update_gradient_preview(
+                    self._clamped_point(self._scene_point_from_viewport(event.position()))
+                )
+                event.accept()
+                return
             if not self._accept_move_event(event):
                 event.accept()
                 return
@@ -261,15 +828,22 @@ class DrawingGraphicsView(QGraphicsView):
             if self._is_abnormal_jump(scene_pos):
                 event.accept()
                 return
-            self._draw_stroke(self._last_draw_point, scene_pos)
+            self._draw_stroke(self._last_draw_point, scene_pos, self._smoothed_event_pressure(event))
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if self._is_drawing and event.button() == Qt.MouseButton.LeftButton:
+            if self._drawing_tool == "gradient":
+                self._commit_gradient(
+                    self._clamped_point(self._scene_point_from_viewport(event.position()))
+                )
+                event.accept()
+                return
             self._append_input_point(
                 self._clamped_point(self._scene_point_from_viewport(event.position())),
+                pressure=self._smoothed_event_pressure(event),
                 force=True,
             )
             self._finish_active_stroke(emit_change=True)
@@ -291,6 +865,12 @@ class DrawingGraphicsView(QGraphicsView):
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # type: ignore[override]
         super().drawForeground(painter, rect)
+        if self._is_drawing and self._drawing_tool == "soft_brush" and self._soft_debug_mode in {
+            "raw",
+            "resampled",
+            "capsules",
+        }:
+            self._soft_renderer.draw_debug(painter, self._soft_debug_mode)
         if not self._drawing_enabled or not self._cursor_in_bounds or self._cursor_scene_pos is None:
             return
 
@@ -325,7 +905,7 @@ class DrawingGraphicsView(QGraphicsView):
     def _drawing_bounds_rect(self) -> QRectF:
         return QRectF(0, 0, self._drawing_image.width(), self._drawing_image.height())
 
-    def _draw_stroke(self, start: QPointF, end: QPointF) -> None:
+    def _draw_stroke(self, start: QPointF, end: QPointF, pressure: float) -> None:
         if self._drawing_image.isNull():
             return
 
@@ -333,25 +913,51 @@ class DrawingGraphicsView(QGraphicsView):
         end = self._clamped_point(end)
         if self._press_point is None:
             self._begin_stroke(start)
-        self._append_input_point(end)
+        self._append_input_point(end, pressure=pressure)
 
-    def _begin_stroke(self, point: QPointF) -> None:
+    def _begin_stroke(self, point: QPointF, pressure: float = 1.0) -> None:
         self._cancel_stroke_state()
         self._create_stroke_preview_layer()
         self._last_draw_point = QPointF()
         self._last_input_point = point
+        self._last_draw_pressure = pressure
+        self._last_input_pressure = pressure
+        self._press_pressure = pressure
+        self._filtered_pressure = pressure
         self._stroke_points = []
         self._stroke_path = QPainterPath()
         self._stroke_dot_points.clear()
-        self._soft_stroke_points.clear()
         self._square_stroke_stamps.clear()
         self._last_square_angle = None
         self._press_point = point
         self._waiting_for_first_motion = True
         self._stroke_has_content = False
+        if self._drawing_tool == "soft_brush":
+            self._soft_renderer.set_canvas_size(self._drawing_image.size())
+            self._soft_renderer.begin(
+                self._brush_size,
+                self._brush_hardness,
+                self._soft_edge_gamma,
+                self._soft_flow,
+                self._soft_renderer_mode,
+                point,
+            )
+        elif self._drawing_tool == "pencil":
+            self._pencil_renderer.set_canvas_size(self._drawing_image.size())
+            self._pencil_renderer.begin(
+                self._brush_size,
+                self._pencil_grain,
+                self._pencil_density / 100,
+                self._pencil_pressure_size,
+                self._pencil_pressure_density,
+                self._pencil_tip_variation / 100,
+            )
 
-    def _append_input_point(self, point: QPointF, *, force: bool = False) -> None:
+    def _append_input_point(self, point: QPointF, *, pressure: float = 1.0, force: bool = False) -> None:
         point = self._clamped_point(point)
+        pressure = max(0.05, min(1.0, pressure))
+        if self._drawing_tool == "soft_brush":
+            self._soft_renderer.add_raw_point(point)
         distance = math.hypot(
             point.x() - self._last_input_point.x(),
             point.y() - self._last_input_point.y(),
@@ -371,7 +977,15 @@ class DrawingGraphicsView(QGraphicsView):
             self._last_input_point = point
             self._stroke_points = [point]
             self._waiting_for_first_motion = False
-            self._queue_linear_segment(start, point, path_already_started=True)
+            self._queue_linear_segment(
+                start,
+                point,
+                start_pressure=self._press_pressure,
+                end_pressure=pressure,
+                path_already_started=True,
+            )
+            self._last_draw_pressure = pressure
+            self._last_input_pressure = pressure
             return
 
         if not force and distance < self._resample_spacing() * 0.35:
@@ -379,25 +993,42 @@ class DrawingGraphicsView(QGraphicsView):
 
         steps = max(1, math.ceil(distance / self._resample_spacing()))
         origin = self._last_input_point
+        origin_pressure = self._last_input_pressure
         for step in range(1, steps + 1):
             ratio = step / steps
             sample = QPointF(
                 origin.x() + (point.x() - origin.x()) * ratio,
                 origin.y() + (point.y() - origin.y()) * ratio,
             )
-            self._append_smoothed_point(sample)
+            sample_pressure = origin_pressure + (pressure - origin_pressure) * ratio
+            self._append_smoothed_point(sample, sample_pressure)
         self._last_input_point = point
+        self._last_input_pressure = pressure
 
-    def _append_smoothed_point(self, point: QPointF) -> None:
+    def _append_smoothed_point(self, point: QPointF, pressure: float) -> None:
         if self._stroke_points and self._points_are_close(self._stroke_points[-1], point):
             return
 
-        self._queue_linear_segment(self._last_draw_point, point)
+        self._queue_linear_segment(
+            self._last_draw_point,
+            point,
+            start_pressure=self._last_draw_pressure,
+            end_pressure=pressure,
+        )
         self._previous_point = self._last_draw_point
         self._last_draw_point = point
+        self._last_draw_pressure = pressure
         self._stroke_points = [point]
 
-    def _queue_linear_segment(self, start: QPointF, end: QPointF, *, path_already_started: bool = False) -> None:
+    def _queue_linear_segment(
+        self,
+        start: QPointF,
+        end: QPointF,
+        *,
+        start_pressure: float = 1.0,
+        end_pressure: float = 1.0,
+        path_already_started: bool = False,
+    ) -> None:
         if self._points_are_close(start, end):
             return
         if self._stroke_path.isEmpty():
@@ -405,9 +1036,18 @@ class DrawingGraphicsView(QGraphicsView):
         if not path_already_started:
             self._stroke_path.lineTo(end)
         if self._drawing_tool == "soft_brush":
-            self._append_soft_line_points(start, end)
+            self._soft_renderer.add_capsule(
+                start,
+                end,
+                self._soft_radius_for_pressure(start_pressure),
+                self._soft_radius_for_pressure(end_pressure),
+                self._soft_strength_for_pressure(start_pressure),
+                self._soft_strength_for_pressure(end_pressure),
+            )
         elif self._drawing_tool == "square_brush":
-            self._append_square_line_stamps(start, end)
+            self._append_square_line_stamps(start, end, start_pressure, end_pressure)
+        elif self._drawing_tool == "pencil":
+            self._pencil_renderer.add_segment(start, end, start_pressure, end_pressure)
         self._stroke_has_content = True
         self._schedule_drawing_preview()
 
@@ -418,18 +1058,28 @@ class DrawingGraphicsView(QGraphicsView):
             self._stroke_path.moveTo(start)
         self._stroke_path.quadTo(control, end)
         if self._drawing_tool == "soft_brush":
-            self._append_soft_curve_points(start, control, end)
+            self._soft_renderer.add_capsule(start, end)
         elif self._drawing_tool == "square_brush":
             self._append_square_curve_stamps(start, control, end)
+        elif self._drawing_tool == "pencil":
+            self._pencil_renderer.add_segment(start, end, 1.0, 1.0)
         self._stroke_has_content = True
         self._schedule_drawing_preview()
 
     def _queue_dot(self, point: QPointF) -> None:
         self._stroke_dot_points = [point]
         if self._drawing_tool == "soft_brush":
-            self._soft_stroke_points = [point]
+            self._soft_renderer.add_dot(
+                point,
+                self._soft_radius_for_pressure(self._press_pressure),
+                self._soft_strength_for_pressure(self._press_pressure),
+            )
         elif self._drawing_tool == "square_brush":
-            self._square_stroke_stamps = [(point, self._square_brush_fixed_angle)]
+            self._square_stroke_stamps = [
+                (point, self._square_brush_fixed_angle, self._square_scale_for_pressure(self._press_pressure))
+            ]
+        elif self._drawing_tool == "pencil":
+            self._pencil_renderer.add_dot(point, self._press_pressure)
         self._stroke_has_content = True
         self._schedule_drawing_preview()
 
@@ -439,6 +1089,9 @@ class DrawingGraphicsView(QGraphicsView):
             self._drawing_preview_timer.start(16)
 
     def _finish_active_stroke(self, *, emit_change: bool) -> None:
+        if self._gradient_start is not None:
+            self._cancel_gradient()
+            return
         if not self._is_drawing and self._press_point is None:
             return
 
@@ -479,6 +1132,10 @@ class DrawingGraphicsView(QGraphicsView):
             self._rebuild_square_stroke_preview()
             self._refresh_stroke_preview_item()
             return
+        if self._drawing_tool == "pencil":
+            self._pencil_renderer.render_colored(self._stroke_preview_image, self._brush_color)
+            self._refresh_stroke_preview_item()
+            return
 
         self._stroke_preview_image.fill(Qt.GlobalColor.transparent)
         painter = QPainter(self._stroke_preview_image)
@@ -513,6 +1170,136 @@ class DrawingGraphicsView(QGraphicsView):
             min(max(point.y(), bounds.top()), bounds.bottom()),
         )
 
+    def _apply_bucket(self, point: QPointF) -> None:
+        if self._drawing_image.isNull():
+            return
+        x = int(point.x())
+        y = int(point.y())
+        if not self._drawing_image.rect().contains(x, y):
+            return
+        before = self._drawing_image.copy()
+        fill_color = QColor(self._brush_color)
+        fill_color.setAlpha(round(255 * self._brush_opacity))
+        if not self._flood_fill(x, y, fill_color):
+            return
+        self.stroke_started.emit(before)
+        self._refresh_drawing_item()
+        self.drawing_changed.emit(self._drawing_image.copy())
+
+    def _flood_fill(self, start_x: int, start_y: int, fill_color: QColor) -> bool:
+        target = self._drawing_image.pixelColor(start_x, start_y)
+        if self._colors_are_close(target, fill_color):
+            return False
+
+        width = self._drawing_image.width()
+        height = self._drawing_image.height()
+        stack = [(start_x, start_y)]
+        tolerance = 8
+        changed = False
+        while stack:
+            x, y = stack.pop()
+            if y < 0 or y >= height or x < 0 or x >= width:
+                continue
+            if not self._colors_are_close(self._drawing_image.pixelColor(x, y), target, tolerance):
+                continue
+
+            left = x
+            while left > 0 and self._colors_are_close(self._drawing_image.pixelColor(left - 1, y), target, tolerance):
+                left -= 1
+            right = x
+            while right + 1 < width and self._colors_are_close(self._drawing_image.pixelColor(right + 1, y), target, tolerance):
+                right += 1
+
+            for fill_x in range(left, right + 1):
+                self._drawing_image.setPixelColor(fill_x, y, fill_color)
+            changed = True
+
+            for neighbor_y in (y - 1, y + 1):
+                if neighbor_y < 0 or neighbor_y >= height:
+                    continue
+                fill_x = left
+                while fill_x <= right:
+                    while fill_x <= right and not self._colors_are_close(
+                        self._drawing_image.pixelColor(fill_x, neighbor_y), target, tolerance
+                    ):
+                        fill_x += 1
+                    if fill_x > right:
+                        break
+                    stack.append((fill_x, neighbor_y))
+                    while fill_x <= right and self._colors_are_close(
+                        self._drawing_image.pixelColor(fill_x, neighbor_y), target, tolerance
+                    ):
+                        fill_x += 1
+        return changed
+
+    @staticmethod
+    def _colors_are_close(first: QColor, second: QColor, tolerance: int = 0) -> bool:
+        return (
+            abs(first.red() - second.red()) <= tolerance
+            and abs(first.green() - second.green()) <= tolerance
+            and abs(first.blue() - second.blue()) <= tolerance
+            and abs(first.alpha() - second.alpha()) <= tolerance
+        )
+
+    def _begin_gradient(self, point: QPointF) -> None:
+        self._cancel_stroke_state()
+        self._create_stroke_preview_layer()
+        self._gradient_start = QPointF(point)
+        self._gradient_end = QPointF(point)
+        self._is_drawing = True
+        self._render_gradient_preview()
+
+    def _update_gradient_preview(self, point: QPointF) -> None:
+        if self._gradient_start is None:
+            return
+        self._gradient_end = QPointF(point)
+        self._render_gradient_preview()
+
+    def _render_gradient_preview(self) -> None:
+        if self._gradient_start is None or self._stroke_preview_image.isNull():
+            return
+        self._stroke_preview_image.fill(Qt.GlobalColor.transparent)
+        start_color = QColor(self._brush_color)
+        start_color.setAlpha(255)
+        end_color = QColor(self._gradient_end_color)
+        if not end_color.isValid():
+            end_color = QColor(0, 0, 0, 0)
+        if self._colors_are_close(start_color, end_color) and self._points_are_close(
+            self._gradient_start, self._gradient_end
+        ):
+            end_color = QColor(start_color)
+        gradient = QLinearGradient(self._gradient_start, self._gradient_end)
+        gradient.setColorAt(0.0, start_color)
+        gradient.setColorAt(1.0, end_color)
+        painter = QPainter(self._stroke_preview_image)
+        painter.fillRect(self._stroke_preview_image.rect(), gradient)
+        painter.end()
+        self._refresh_stroke_preview_item()
+
+    def _commit_gradient(self, point: QPointF) -> None:
+        if self._gradient_start is None or self._drawing_image.isNull():
+            self._cancel_gradient()
+            return
+        self._gradient_end = QPointF(point)
+        self._render_gradient_preview()
+        before = self._drawing_image.copy()
+        painter = QPainter(self._drawing_image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.setOpacity(self._brush_opacity)
+        painter.drawImage(0, 0, self._stroke_preview_image)
+        painter.end()
+        self.stroke_started.emit(before)
+        self._refresh_drawing_item()
+        self._clear_stroke_preview_layer()
+        self._gradient_start = None
+        self._is_drawing = False
+        self.drawing_changed.emit(self._drawing_image.copy())
+
+    def _cancel_gradient(self) -> None:
+        self._gradient_start = None
+        self._is_drawing = False
+        self._clear_stroke_preview_layer()
+
     def _refresh_drawing_item(self) -> None:
         if self._drawing_item is None:
             return
@@ -527,11 +1314,6 @@ class DrawingGraphicsView(QGraphicsView):
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         self._stroke_preview_image.fill(Qt.GlobalColor.transparent)
-        self._soft_stroke_mask = QImage(
-            self._drawing_image.size(),
-            QImage.Format.Format_ARGB32_Premultiplied,
-        )
-        self._soft_stroke_mask.fill(Qt.GlobalColor.transparent)
         self._square_stroke_mask = QImage(
             self._drawing_image.size(),
             QImage.Format.Format_ARGB32_Premultiplied,
@@ -547,7 +1329,7 @@ class DrawingGraphicsView(QGraphicsView):
         if self._drawing_tool == "eraser":
             preview = self._drawing_image.copy()
             painter = QPainter(preview)
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
             painter.drawImage(0, 0, self._stroke_preview_image)
             painter.end()
             self._stroke_preview_item.setOpacity(1.0)
@@ -566,7 +1348,7 @@ class DrawingGraphicsView(QGraphicsView):
             return
         painter = QPainter(self._drawing_image)
         if self._drawing_tool == "eraser":
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
         else:
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             painter.setOpacity(self._brush_opacity)
@@ -576,7 +1358,6 @@ class DrawingGraphicsView(QGraphicsView):
 
     def _clear_stroke_preview_layer(self) -> None:
         self._stroke_preview_image = QImage()
-        self._soft_stroke_mask = QImage()
         self._square_stroke_mask = QImage()
         if self._stroke_preview_item is not None:
             self._stroke_preview_item.setPixmap(QPixmap())
@@ -584,79 +1365,15 @@ class DrawingGraphicsView(QGraphicsView):
         if self._drawing_item is not None:
             self._drawing_item.show()
 
-    def _append_soft_curve_points(self, start: QPointF, control: QPointF, end: QPointF) -> None:
-        length = math.hypot(end.x() - start.x(), end.y() - start.y())
-        steps = max(1, math.ceil(length / self._soft_stamp_spacing()))
-        for step in range(steps + 1):
-            t = step / steps
-            inverse = 1 - t
-            self._soft_stroke_points.append(
-                QPointF(
-                    inverse * inverse * start.x() + 2 * inverse * t * control.x() + t * t * end.x(),
-                    inverse * inverse * start.y() + 2 * inverse * t * control.y() + t * t * end.y(),
-                )
-            )
-
-    def _append_soft_line_points(self, start: QPointF, end: QPointF) -> None:
-        distance = math.hypot(end.x() - start.x(), end.y() - start.y())
-        steps = max(1, math.ceil(distance / self._soft_stamp_spacing()))
-        for step in range(steps + 1):
-            ratio = step / steps
-            self._soft_stroke_points.append(
-                QPointF(
-                    start.x() + (end.x() - start.x()) * ratio,
-                    start.y() + (end.y() - start.y()) * ratio,
-                )
-            )
-
-    def _soft_stamp_spacing(self) -> float:
+    def _stamp_spacing(self) -> float:
         return max(0.25, self._brush_size * 0.08)
 
-    def _soft_tip_mask(self) -> QImage:
-        dpr = max(1.0, self.devicePixelRatioF())
-        key = (self._brush_size, self._brush_hardness, round(dpr * 100))
-        cached = self._soft_tip_cache.get(key)
-        if cached is not None:
-            return cached
-
-        diameter = max(1, math.ceil(self._brush_size * dpr))
-        image = QImage(diameter, diameter, QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(Qt.GlobalColor.transparent)
-        radius = diameter / 2
-        hard_radius = radius * (self._brush_hardness / 100)
-        for y in range(diameter):
-            for x in range(diameter):
-                distance = math.hypot(x + 0.5 - radius, y + 0.5 - radius)
-                if distance >= radius:
-                    alpha = 0
-                elif self._brush_hardness >= 100 or distance <= hard_radius:
-                    alpha = 255
-                else:
-                    ratio = (distance - hard_radius) / max(0.001, radius - hard_radius)
-                    smoothstep = ratio * ratio * (3 - 2 * ratio)
-                    alpha = round(255 * (1 - smoothstep))
-                image.setPixelColor(x, y, QColor(255, 255, 255, alpha))
-        image.setDevicePixelRatio(dpr)
-        self._soft_tip_cache[key] = image
-        return image
-
     def _rebuild_soft_stroke_preview(self) -> None:
-        if self._soft_stroke_mask.isNull():
-            return
-        self._soft_stroke_mask.fill(Qt.GlobalColor.transparent)
-        if not self._soft_stroke_points:
-            return
-
-        tip = self._soft_tip_mask()
-        painter = QPainter(self._soft_stroke_mask)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Lighten)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        offset_x = tip.width() / (2 * tip.devicePixelRatio())
-        offset_y = tip.height() / (2 * tip.devicePixelRatio())
-        for point in self._soft_stroke_points:
-            painter.drawImage(QPointF(point.x() - offset_x, point.y() - offset_y), tip)
-        painter.end()
-        self._colorize_stroke_mask(self._soft_stroke_mask)
+        self._soft_renderer.render_colored(
+            self._stroke_preview_image,
+            self._brush_color,
+            mask_only=self._soft_debug_mode == "mask",
+        )
 
     def _square_tip_mask(self) -> QImage:
         dpr = max(1.0, self.devicePixelRatioF())
@@ -681,7 +1398,7 @@ class DrawingGraphicsView(QGraphicsView):
 
     def _append_square_curve_stamps(self, start: QPointF, control: QPointF, end: QPointF) -> None:
         length = math.hypot(end.x() - start.x(), end.y() - start.y())
-        steps = max(1, math.ceil(length / self._soft_stamp_spacing()))
+        steps = max(1, math.ceil(length / self._stamp_spacing()))
         for step in range(steps + 1):
             t = step / steps
             inverse = 1 - t
@@ -692,14 +1409,21 @@ class DrawingGraphicsView(QGraphicsView):
             tangent_x = 2 * inverse * (control.x() - start.x()) + 2 * t * (end.x() - control.x())
             tangent_y = 2 * inverse * (control.y() - start.y()) + 2 * t * (end.y() - control.y())
             angle = self._square_stamp_angle(math.atan2(tangent_y, tangent_x))
-            self._square_stroke_stamps.append((point, angle))
+            self._square_stroke_stamps.append((point, angle, 1.0))
 
-    def _append_square_line_stamps(self, start: QPointF, end: QPointF) -> None:
+    def _append_square_line_stamps(
+        self,
+        start: QPointF,
+        end: QPointF,
+        start_pressure: float,
+        end_pressure: float,
+    ) -> None:
         distance = math.hypot(end.x() - start.x(), end.y() - start.y())
-        steps = max(1, math.ceil(distance / self._soft_stamp_spacing()))
+        steps = max(1, math.ceil(distance / self._stamp_spacing()))
         angle = self._square_stamp_angle(math.atan2(end.y() - start.y(), end.x() - start.x()))
         for step in range(steps + 1):
             ratio = step / steps
+            pressure = start_pressure + (end_pressure - start_pressure) * ratio
             self._square_stroke_stamps.append(
                 (
                     QPointF(
@@ -707,6 +1431,7 @@ class DrawingGraphicsView(QGraphicsView):
                         start.y() + (end.y() - start.y()) * ratio,
                     ),
                     angle,
+                    self._square_scale_for_pressure(pressure),
                 )
             )
 
@@ -717,7 +1442,7 @@ class DrawingGraphicsView(QGraphicsView):
             self._last_square_angle = tangent_angle
             return tangent_angle
         delta = (tangent_angle - self._last_square_angle + math.pi) % (2 * math.pi) - math.pi
-        self._last_square_angle += delta * 0.35
+        self._last_square_angle += delta * 0.18
         return self._last_square_angle
 
     def _rebuild_square_stroke_preview(self) -> None:
@@ -733,10 +1458,11 @@ class DrawingGraphicsView(QGraphicsView):
         painter = QPainter(self._square_stroke_mask)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Lighten)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        for point, angle in self._square_stroke_stamps:
+        for point, angle, scale in self._square_stroke_stamps:
             painter.save()
             painter.translate(point)
             painter.rotate(math.degrees(angle))
+            painter.scale(scale, scale)
             painter.drawImage(QPointF(-logical_width / 2, -logical_height / 2), tip)
             painter.restore()
         painter.end()
@@ -782,10 +1508,11 @@ class DrawingGraphicsView(QGraphicsView):
         tinted.fill(Qt.GlobalColor.transparent)
         painter = QPainter(tinted)
         painter.drawPixmap(0, 0, pixmap)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Multiply)
+        # Drawing layers often contain black strokes.  Multiply preserves black,
+        # so the onion color was effectively invisible.  SourceIn replaces RGB
+        # while retaining the original alpha mask.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
         painter.fillRect(tinted.rect(), color)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-        painter.drawPixmap(0, 0, pixmap)
         painter.end()
         return tinted
 
@@ -800,12 +1527,17 @@ class DrawingGraphicsView(QGraphicsView):
     def _cancel_stroke_state(self) -> None:
         self._drawing_preview_timer.stop()
         self._is_drawing = False
+        self._gradient_start = None
         self._clear_stroke_preview_layer()
         self._reset_stroke_tracking()
 
     def _reset_stroke_tracking(self) -> None:
         self._last_draw_point = QPointF()
         self._last_input_point = QPointF()
+        self._last_draw_pressure = 1.0
+        self._last_input_pressure = 1.0
+        self._press_pressure = 1.0
+        self._filtered_pressure = 1.0
         self._previous_point = QPointF()
         self._midpoint = QPointF()
         self._control_point = QPointF()
@@ -815,11 +1547,43 @@ class DrawingGraphicsView(QGraphicsView):
         self._stroke_points = []
         self._stroke_path = QPainterPath()
         self._stroke_dot_points.clear()
-        self._soft_stroke_points.clear()
+        self._soft_renderer.reset()
         self._square_stroke_stamps.clear()
+        self._pencil_renderer.reset()
         self._last_square_angle = None
         self._stroke_has_content = False
         self._drawing_dirty = False
+
+    def _soft_radius_for_pressure(self, pressure: float) -> float:
+        scale = pressure if self._soft_pressure_size else 1.0
+        return max(0.5, self._brush_size * scale / 2)
+
+    def _soft_strength_for_pressure(self, pressure: float) -> float:
+        return pressure if self._soft_pressure_opacity else 1.0
+
+    def _square_scale_for_pressure(self, pressure: float) -> float:
+        if not self._square_pressure_size_enabled:
+            return 1.0
+        pressure = max(0.0, min(1.0, pressure))
+        scale = 1.0 - self._square_pressure_size_strength * (1.0 - pressure)
+        return max(self._square_min_pressure_size, min(1.0, scale))
+
+    def _smoothed_event_pressure(self, event: QMouseEvent, *, reset: bool = False) -> float:
+        try:
+            raw_pressure = float(event.point(0).pressure())
+        except (AttributeError, IndexError, TypeError):
+            raw_pressure = 1.0
+        raw_pressure = raw_pressure if raw_pressure > 0.0 else 1.0
+        raw_pressure = max(0.05, min(1.0, raw_pressure))
+        if reset:
+            self._filtered_pressure = raw_pressure
+            return raw_pressure
+
+        # Pressure samples can be sparse and noisy.  Limit the allowed change
+        # per event, then apply a low-pass response before arc-length resampling.
+        delta = max(-0.18, min(0.18, raw_pressure - self._filtered_pressure))
+        self._filtered_pressure = max(0.05, min(1.0, self._filtered_pressure + delta * 0.38))
+        return self._filtered_pressure
 
     def _resample_spacing(self) -> float:
         return min(1.5, max(0.75, self._brush_size * 0.08))
