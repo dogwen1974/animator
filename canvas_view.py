@@ -4,7 +4,7 @@ import math
 from time import perf_counter
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QImage, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QWidget
 
 
@@ -2080,6 +2080,7 @@ class BlankCanvasView(DrawingGraphicsView):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
+        self._paper_visible = True
         self._canvas_item = QGraphicsRectItem(0, 0, 1024, 768)
         self._canvas_item.setBrush(QColor("#ffffff"))
         self._canvas_item.setPen(QPen(QColor("#d1d5db"), 1))
@@ -2100,6 +2101,21 @@ class BlankCanvasView(DrawingGraphicsView):
         self._grid_scale = 1
         self.set_drawing_layer_size(1024, 768)
         self.fit_to_view()
+
+    def set_paper_visible(self, visible: bool) -> None:
+        self._paper_visible = bool(visible)
+        self._canvas_item.setBrush(QColor("#ffffff") if self._paper_visible else self._checkerboard_brush())
+        self.viewport().update()
+
+    @staticmethod
+    def _checkerboard_brush() -> QBrush:
+        tile = QPixmap(16, 16)
+        tile.fill(QColor("#d9dde3"))
+        painter = QPainter(tile)
+        painter.fillRect(0, 0, 8, 8, QColor("#f2f3f5"))
+        painter.fillRect(8, 8, 8, 8, QColor("#f2f3f5"))
+        painter.end()
+        return QBrush(tile)
 
     def set_canvas_size(self, width: int, height: int, grid_scale: int = 1) -> None:
         width = max(1, width)

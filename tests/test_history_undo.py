@@ -10,12 +10,44 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QAbstractItemView, QListWidget
 
 from history import HistoryMemoryManager
-from pyside6_frame_viewer import FrameViewerWindow
+from pyside6_frame_viewer import FrameViewerWindow, TimelineGeometry
+
+
+class TimelineGeometryTests(unittest.TestCase):
+    def test_frame_centers_share_one_coordinate_system(self) -> None:
+        geometry = TimelineGeometry()
+        self.assertEqual(geometry.frame_width(), 38)
+        self.assertEqual(geometry.frame_left(3), 114)
+        self.assertEqual(geometry.frame_center(3), 133.0)
+        self.assertEqual(geometry.frame_right(3), 152)
+
+    def test_zoom_changes_frame_and_content_width_together(self) -> None:
+        geometry = TimelineGeometry()
+        geometry.set_zoom_percent(150)
+        self.assertEqual(geometry.frame_width(), 57)
+        self.assertEqual(geometry.row_height(), 48)
+        self.assertEqual(geometry.content_width(12), 684)
+
+    def test_click_coordinate_maps_to_frame_index(self) -> None:
+        geometry = TimelineGeometry(scroll_x=38)
+        self.assertEqual(geometry.frame_index_at(0, 10), 1)
+        self.assertEqual(geometry.frame_index_at(37, 10), 1)
+        self.assertEqual(geometry.frame_index_at(38, 10), 2)
+
+    def test_drag_coordinate_maps_to_insert_index(self) -> None:
+        geometry = TimelineGeometry()
+        self.assertEqual(geometry.insert_index_at(18, 10), 0)
+        self.assertEqual(geometry.insert_index_at(19, 10), 1)
+        self.assertEqual(geometry.insert_index_at(95, 10), 3)
+
+    def test_visible_range_accounts_for_scroll_offset(self) -> None:
+        geometry = TimelineGeometry(scroll_x=76)
+        self.assertEqual(geometry.visible_frame_range(76, 10), (2, 3))
 
 
 class DrawingHistoryUndoTests(unittest.TestCase):
@@ -518,6 +550,31 @@ class DrawingHistoryUndoTests(unittest.TestCase):
         composite = self.window._composited_visible_drawing(frame_id, QSize(64, 64))
         self.assertEqual(composite.pixelColor(4, 4), QColor("#ef4444"))
 
+    def test_async_thumbnail_refresh_keeps_top_group_isolated(self) -> None:
+        frame_id = self.window.frames[0].frame_id
+        self.window.thumbnail_display_mode = "drawing"
+
+        lower_red = self._fill_rect(self._blank_image(), QRect(2, 2, 8, 8), QColor("#ef4444"))
+        self.window.drawing_layers[0] = lower_red
+        self.window._store_active_layer_group()
+
+        self.window.add_layer_group()
+        top_group = self.window.layer_groups[0]
+        top_blue = self._fill_rect(self._blank_image(), QRect(20, 20, 8, 8), QColor("#2563eb"))
+        self.window.drawing_layers[0] = top_blue
+        self.window._store_active_layer_group()
+        self.window._rebuild_group_timeline_rows()
+
+        # Reproduce the delayed legacy refresh that previously replaced only
+        # the first row with an all-visible-groups composite.
+        self.window._mark_frame_thumbnail_dirty(frame_id)
+        self.window._update_timeline_item_thumbnail(frame_id, self.window._thumbnail_generation)
+
+        top_timeline = self.window.group_timeline_widgets[top_group.group_id]
+        icon_image = top_timeline.item(0).icon().pixmap(top_timeline.iconSize()).toImage()
+        self.assertTrue(self._contains_color(icon_image, QColor("#2563eb")))
+        self.assertFalse(self._contains_color(icon_image, QColor("#ef4444")))
+
     def test_delayed_stroke_from_previous_group_cannot_write_into_active_group(self) -> None:
         canvas = self.window.trace_only_canvas
         before = self._blank_image()
@@ -606,22 +663,256 @@ class DrawingHistoryUndoTests(unittest.TestCase):
             str(active_timeline.currentItem().data(Qt.ItemDataRole.UserRole)),
             self.window.frames[3].frame_id,
         )
-        self.assertIn("#3b82f6", self.window.group_timeline_row_hosts[original_group_id].styleSheet())
+        self.assertIn("#263650", self.window.group_timeline_visibility_checks[original_group_id].styleSheet())
+        self.assertTrue(active_timeline.property("activeTimelineTrack"))
 
         self.window.timeline_zoom_slider.setValue(150)
         self.assertEqual(self.window.timeline_zoom_value_label.text(), "150%")
-        self.assertEqual(self.window.timeline.iconSize(), QSize(96, 54))
-        self.assertEqual(self.window.timeline.gridSize(), QSize(162, 82))
+        self.assertEqual(self.window.timeline.iconSize(), QSize(53, 44))
+        self.assertEqual(self.window.timeline.gridSize(), QSize(57, 48))
         for timeline in self.window.group_timeline_widgets.values():
-            self.assertEqual(timeline.iconSize(), QSize(96, 54))
-            self.assertEqual(timeline.item(0).sizeHint(), QSize(162, 82))
+            self.assertEqual(timeline.iconSize(), QSize(53, 44))
+            self.assertEqual(timeline.item(0).sizeHint(), QSize(57, 48))
         self.assertEqual(self.window.timeline.item(0).text(), "1")
         self.assertEqual(self.window.timeline.item(1).text(), "2")
         self.window.timeline_zoom_slider.setValue(50)
-        self.assertEqual(self.window.timeline.iconSize(), QSize(96, 54))
-        self.assertEqual(self.window.timeline.gridSize(), QSize(54, 82))
-        self.assertLess(self.window.timeline.gridSize().width(), self.window.timeline.iconSize().width())
+        self.assertEqual(self.window.timeline.iconSize(), QSize(16, 24))
+        self.assertEqual(self.window.timeline.gridSize(), QSize(20, 28))
+        self.assertLess(self.window.timeline.iconSize().width(), self.window.timeline.gridSize().width())
         self.window.timeline_zoom_slider.setValue(100)
+
+    def test_group_tracks_share_one_external_horizontal_scroll_model(self) -> None:
+        self.window.add_layer_group()
+        self.window.timeline_zoom_slider.setValue(200)
+        self.window.resize(700, 600)
+        self.window.show()
+        self.app.processEvents()
+
+        self.assertGreater(self.window.timeline_horizontal_scrollbar.maximum(), 0)
+        self.window.timeline_horizontal_scrollbar.setValue(160)
+        self.app.processEvents()
+        for timeline in self.window.group_timeline_widgets.values():
+            self.assertEqual(timeline.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.assertEqual(timeline.horizontalScrollBar().value(), 160)
+            self.assertEqual(timeline.visualItemRect(timeline.item(3)).left(), self.window.timeline_geometry.frame_left(3))
+
+    def test_frame_switch_and_zoom_do_not_clear_group_thumbnail_cache(self) -> None:
+        group = self.window._active_layer_group()
+        frame_id = self.window.frames[0].frame_id
+        self.window._group_frame_thumbnail(group, frame_id)
+        cached_keys = set(self.window._group_thumbnail_cache)
+        self.assertTrue(cached_keys)
+
+        self.window.set_current_frame(1)
+        self.assertTrue(cached_keys.issubset(self.window._group_thumbnail_cache))
+        self.window.timeline_zoom_slider.setValue(150)
+        self.assertTrue(cached_keys.issubset(self.window._group_thumbnail_cache))
+
+        self.window._group_frame_thumbnail(group, frame_id)
+        self.assertGreater(len(self.window._group_thumbnail_cache), len(cached_keys))
+        self.window.timeline_zoom_slider.setValue(100)
+
+    def test_timeline_wheel_scrolls_tracks_vertically_without_horizontal_motion(self) -> None:
+        for _ in range(7):
+            self.window.add_layer_group()
+        self.window.resize(700, 600)
+        self.window.show()
+        self.window.canvas_timeline_splitter.setSizes([300, 300])
+        self.app.processEvents()
+
+        vertical = self.window.timeline_rows_scroll.verticalScrollBar()
+        horizontal = self.window.timeline_horizontal_scrollbar
+        self.assertGreater(vertical.maximum(), 0)
+        horizontal.setValue(min(120, horizontal.maximum()))
+        horizontal_before = horizontal.value()
+        vertical.setValue(0)
+        wheel = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(self.window.timeline.viewport(), wheel)
+        self.assertEqual(vertical.value(), 32)
+        self.assertEqual(horizontal.value(), horizontal_before)
+
+        shifted_wheel = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, 0),
+            QPoint(-120, 0),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.ShiftModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(self.window.group_timeline_visibility_checks[self.window.layer_groups[0].group_id], shifted_wheel)
+        self.assertEqual(vertical.value(), 64)
+        self.assertEqual(horizontal.value(), horizontal_before)
+
+        pixel_wheel = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, -7),
+            QPoint(0, 0),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(self.window.timeline_paper_track, pixel_wheel)
+        self.assertEqual(vertical.value(), 71)
+        self.assertEqual(horizontal.value(), horizontal_before)
+
+    def test_timeline_track_cannot_consume_wheel_at_two_hundred_percent_zoom(self) -> None:
+        for _ in range(7):
+            self.window.add_layer_group()
+        self.window.resize(700, 600)
+        self.window.show()
+        self.window.canvas_timeline_splitter.setSizes([300, 300])
+        self.window.timeline_zoom_slider.setValue(200)
+        self.app.processEvents()
+
+        track = self.window.timeline
+        vertical = self.window.timeline_rows_scroll.verticalScrollBar()
+        external_horizontal = self.window.timeline_horizontal_scrollbar
+        internal_horizontal = track.horizontalScrollBar()
+        self.assertGreater(internal_horizontal.maximum(), 0)
+        vertical.setValue(0)
+        external_horizontal.setValue(min(140, external_horizontal.maximum()))
+        internal_before = internal_horizontal.value()
+        external_before = external_horizontal.value()
+        wheel = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+
+        # Exercise the QListWidget fallback path directly.  It must forward to
+        # vertical scrolling instead of changing its now-scrollable hidden bar.
+        track.wheelEvent(wheel)
+        self.assertEqual(vertical.value(), 32)
+        self.assertEqual(external_horizontal.value(), external_before)
+        self.assertEqual(internal_horizontal.value(), internal_before)
+
+        horizontal_gesture = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(12, 0),
+            QPoint(0, 0),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(self.window.timeline.viewport(), horizontal_gesture)
+        self.assertEqual(vertical.value(), 32)
+        self.assertEqual(external_horizontal.value(), external_before)
+        self.assertEqual(internal_horizontal.value(), internal_before)
+
+    def test_horizontal_slider_drag_only_updates_shared_offset(self) -> None:
+        self.window.timeline_zoom_slider.setValue(200)
+        self.window.resize(700, 600)
+        self.window.show()
+        self.app.processEvents()
+        scrollbar = self.window.timeline_horizontal_scrollbar
+        self.assertGreater(scrollbar.maximum(), 0)
+        self.window._thumbnail_refresh_timer.stop()
+        cache_before = dict(self.window._group_thumbnail_cache)
+        range_before = (scrollbar.minimum(), scrollbar.maximum(), scrollbar.pageStep())
+
+        scrollbar.setSliderDown(True)
+        positions = [20, 85, 160, min(260, scrollbar.maximum())]
+        observed = []
+        for position in positions:
+            scrollbar.setSliderPosition(position)
+            observed.append(self.window.timeline_geometry.scroll_x)
+            self.assertFalse(self.window._thumbnail_refresh_timer.isActive())
+        self.assertEqual(observed, positions)
+        self.assertEqual((scrollbar.minimum(), scrollbar.maximum(), scrollbar.pageStep()), range_before)
+        self.assertEqual(self.window._group_thumbnail_cache, cache_before)
+        scrollbar.setSliderDown(False)
+
+    def test_paper_visibility_and_group_thumbnail_background_are_independent(self) -> None:
+        self.window.current_drawing_size = QSize(64, 64)
+        frame_id = self.window.frames[0].frame_id
+        drawing = self._fill_rect(self._blank_image(), QRect(8, 8, 12, 12), QColor("#ef4444"))
+        self.window.drawing_layers[0] = drawing
+        self.window._store_active_layer_group()
+        group = self.window._active_layer_group()
+        self.window.thumbnail_display_mode = "drawing"
+
+        thumbnail = self.window._group_frame_thumbnail(group, frame_id).toImage()
+        self.assertEqual(drawing.pixelColor(0, 0).alpha(), 0)
+        self.assertEqual(thumbnail.pixelColor(1, thumbnail.height() // 2), QColor("#f0f1f2"))
+        self.assertTrue(self._contains_color(thumbnail, QColor("#ef4444")))
+        group_cache_before = dict(self.window._group_thumbnail_cache)
+        timeline_before = self.window.group_timeline_widgets[group.group_id]
+
+        self.window._timeline_group_visibility_changed(group.group_id, False)
+        hidden_thumbnail = self.window._group_frame_thumbnail(group, frame_id).toImage()
+        self.assertTrue(self._contains_color(hidden_thumbnail, QColor("#ef4444")))
+        self.assertEqual(self.window._group_thumbnail_cache, group_cache_before)
+        self.assertIs(self.window.group_timeline_widgets[group.group_id], timeline_before)
+        self.assertIsNone(self.window._composited_visible_drawing(frame_id, QSize(64, 64)))
+
+        self.window.set_paper_visible(False)
+        self.assertFalse(self.window.trace_only_canvas._paper_visible)
+        self.assertFalse(self.window.trace_only_canvas._canvas_item.brush().texture().isNull())
+        self.assertEqual(self.window._final_composited_drawing(frame_id, QSize(64, 64)).pixelColor(0, 0).alpha(), 0)
+        self.assertEqual(self.window._group_thumbnail_cache, group_cache_before)
+        self.window.set_paper_visible(True)
+        self.assertEqual(
+            self.window._final_composited_drawing(frame_id, QSize(64, 64)).pixelColor(0, 0),
+            QColor("#ffffff"),
+        )
+
+    def test_copy_and_paste_strokes_stays_within_source_group(self) -> None:
+        group = self.window._active_layer_group()
+        source_id = self.window.frames[0].frame_id
+        target_id = self.window.frames[1].frame_id
+        red = self._fill_rect(self._blank_image(), QRect(5, 6, 12, 10), QColor("#ef4444"))
+        self.window.drawing_layers[0] = red
+        self.window._store_active_layer_group()
+
+        self.assertTrue(self.window.copy_layer_strokes(group.group_id, source_id))
+        red.fill(Qt.GlobalColor.transparent)
+        self.assertTrue(self.window.paste_layer_strokes(group.group_id, target_id))
+        pasted = self.window._drawing_for_group(group, target_id)
+        self.assertIsNotNone(pasted)
+        self.assertTrue(self._contains_color(pasted, QColor("#ef4444")))
+        self.assertEqual(group.histories[target_id].undo[-1].kind, "paste")
+
+        self.window.add_layer_group()
+        other_group = self.window._active_layer_group()
+        self.assertFalse(self.window.paste_layer_strokes(other_group.group_id, target_id))
+        self.assertIsNone(self.window._drawing_for_group(other_group, target_id))
+
+    def test_duplicate_layer_group_copies_content_without_sharing_images(self) -> None:
+        source = self.window._active_layer_group()
+        frame_id = self.window.frames[0].frame_id
+        source_image = self._fill_rect(self._blank_image(), QRect(3, 4, 9, 8), QColor("#2563eb"))
+        self.window.drawing_layers[0] = source_image
+        self.window._store_active_layer_group()
+
+        duplicate = self.window.duplicate_layer_group(source.group_id)
+        self.assertIsNotNone(duplicate)
+        self.assertNotEqual(duplicate.group_id, source.group_id)
+        self.assertTrue(duplicate.name.startswith(source.name + " 副本"))
+        self.assertEqual(self.window.layer_groups.index(duplicate), self.window.layer_groups.index(source) - 1)
+        duplicate_image = duplicate.drawings[frame_id]
+        self.assertTrue(self._contains_color(duplicate_image, QColor("#2563eb")))
+        duplicate_image.fill(Qt.GlobalColor.transparent)
+        self.assertTrue(self._contains_color(source.drawings[frame_id], QColor("#2563eb")))
 
     def test_onion_skin_uses_only_active_group_and_top_number_switches_frame(self) -> None:
         self.window.current_drawing_size = QSize(64, 64)
@@ -726,6 +1017,7 @@ class DrawingHistoryUndoTests(unittest.TestCase):
         self.window.layer_groups[1].visible = False
         self.window.layer_groups[0].name = "高光"
         self.window.set_playback_range(1, 4)
+        self.window.set_paper_visible(False)
 
         with tempfile.TemporaryDirectory() as directory:
             project_path = Path(directory) / "layers.giftrace"
@@ -737,6 +1029,7 @@ class DrawingHistoryUndoTests(unittest.TestCase):
         self.assertEqual([group.visible for group in self.window.layer_groups], [True, False])
         self.assertEqual(self.window.active_layer_group_id, second_id)
         self.assertEqual((self.window.playback_range_start, self.window.playback_range_end), (1, 4))
+        self.assertFalse(self.window.paper_visible)
         self.assertTrue(self._contains_color(self.window.drawing_layers[0], QColor("#2563eb")))
         restored_first = next(group for group in self.window.layer_groups if group.group_id == first_id)
         self.assertTrue(self._contains_color(restored_first.drawings[self.window.frames[0].frame_id], QColor("#ef4444")))
