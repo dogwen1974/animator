@@ -542,6 +542,7 @@ class DrawingGraphicsView(QGraphicsView):
         self._square_stroke_mask = QImage()
         self._drawing_enabled = False
         self._drawing_blocked = False
+        self._drawing_layer_visible = True
         self._drawing_tool = "brush"
         self._brush_color = QColor("#000000")
         self._brush_opacity = 1.0
@@ -591,6 +592,10 @@ class DrawingGraphicsView(QGraphicsView):
         self._stroke_has_content = False
         self._cursor_scene_pos: QPointF | None = None
         self._cursor_in_bounds = False
+        self._is_translating_drawing = False
+        self._translation_origin = QPointF()
+        self._translation_before = QImage()
+        self._translation_delta = QPointF()
         self._drawing_dirty = False
         self._drawing_preview_timer = QTimer(self)
         self._drawing_preview_timer.setSingleShot(True)
@@ -606,21 +611,28 @@ class DrawingGraphicsView(QGraphicsView):
     def _init_drawing_layer(self, z_value: int) -> None:
         self._drawing_previous_item = QGraphicsPixmapItem()
         self._drawing_next_item = QGraphicsPixmapItem()
+        self._drawing_groups_below_item = QGraphicsPixmapItem()
         self._drawing_item = QGraphicsPixmapItem()
         self._stroke_preview_item = QGraphicsPixmapItem()
+        self._drawing_groups_above_item = QGraphicsPixmapItem()
         self._drawing_previous_item.setZValue(z_value - 2)
         self._drawing_next_item.setZValue(z_value - 1)
+        self._drawing_groups_below_item.setZValue(z_value - 0.5)
         self._drawing_item.setZValue(z_value)
         self._stroke_preview_item.setZValue(z_value + 1)
+        self._drawing_groups_above_item.setZValue(z_value + 2)
         self.scene().addItem(self._drawing_previous_item)
         self.scene().addItem(self._drawing_next_item)
+        self.scene().addItem(self._drawing_groups_below_item)
         self.scene().addItem(self._drawing_item)
         self.scene().addItem(self._stroke_preview_item)
+        self.scene().addItem(self._drawing_groups_above_item)
         self._stroke_preview_item.hide()
 
     def set_drawing_blocked(self, blocked: bool) -> None:
         self._drawing_blocked = blocked
         if blocked:
+            self._cancel_drawing_translation(revert=True)
             self._cancel_stroke_state()
 
     def set_drawing_onion_skin_enabled(self, enabled: bool) -> None:
@@ -659,6 +671,7 @@ class DrawingGraphicsView(QGraphicsView):
 
     def set_drawing_enabled(self, enabled: bool) -> None:
         if not enabled:
+            self._cancel_drawing_translation(revert=True)
             self._cancel_stroke_state()
         self._drawing_enabled = enabled
         if not enabled:
@@ -754,11 +767,25 @@ class DrawingGraphicsView(QGraphicsView):
         self.viewport().update()
 
     def set_drawing_image(self, image: QImage) -> None:
+        self._cancel_drawing_translation(revert=False)
         self._cancel_stroke_state()
         self._drawing_image = image.copy()
         self._refresh_drawing_item()
 
+    def set_drawing_group_images(self, below: QImage | None, above: QImage | None) -> None:
+        """Render non-active animation groups without flattening the editable group."""
+        self._drawing_groups_below_item.setPixmap(QPixmap.fromImage(below) if below is not None else QPixmap())
+        self._drawing_groups_above_item.setPixmap(QPixmap.fromImage(above) if above is not None else QPixmap())
+        self.viewport().update()
+
+    def set_drawing_layer_visible(self, visible: bool) -> None:
+        self._drawing_layer_visible = visible
+        self._drawing_item.setVisible(visible)
+        self._stroke_preview_item.setVisible(visible and not self._stroke_preview_item.pixmap().isNull())
+        self.viewport().update()
+
     def set_drawing_layer_size(self, width: int, height: int) -> None:
+        self._cancel_drawing_translation(revert=True)
         self._cancel_stroke_state()
         width = max(1, width)
         height = max(1, height)
@@ -815,6 +842,12 @@ class DrawingGraphicsView(QGraphicsView):
         self._update_drawing_cursor(event.position())
         if self._drawing_enabled and self._drawing_blocked and event.button() == Qt.MouseButton.LeftButton:
             self.drawing_attempted.emit()
+        if self._should_begin_drawing_translation(event):
+            scene_pos = self._scene_point_from_viewport(event.position())
+            if self._drawing_bounds_rect().contains(scene_pos):
+                self._begin_drawing_translation(scene_pos)
+                event.accept()
+                return
         if self._should_handle_drawing(event):
             scene_pos = self._scene_point_from_viewport(event.position())
             if self._drawing_bounds_rect().contains(scene_pos):
@@ -834,6 +867,10 @@ class DrawingGraphicsView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self._is_translating_drawing:
+            self._update_drawing_translation(self._scene_point_from_viewport(event.position()))
+            event.accept()
+            return
         self._update_drawing_cursor(event.position())
         if self._is_drawing:
             if self._drawing_tool == "gradient":
@@ -856,6 +893,11 @@ class DrawingGraphicsView(QGraphicsView):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         release_start = perf_counter()
+        if self._is_translating_drawing and event.button() == Qt.MouseButton.LeftButton:
+            self._update_drawing_translation(self._scene_point_from_viewport(event.position()))
+            self._finish_drawing_translation(emit_change=True)
+            event.accept()
+            return
         if self._is_drawing and event.button() == Qt.MouseButton.LeftButton:
             if self._drawing_tool == "gradient":
                 self._commit_gradient(
@@ -883,6 +925,7 @@ class DrawingGraphicsView(QGraphicsView):
         super().leaveEvent(event)
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        self._finish_drawing_translation(emit_change=True)
         self._finish_active_stroke(emit_change=True)
         super().focusOutEvent(event)
 
@@ -894,7 +937,12 @@ class DrawingGraphicsView(QGraphicsView):
             "capsules",
         }:
             self._soft_renderer.draw_debug(painter, self._soft_debug_mode)
-        if not self._drawing_enabled or not self._cursor_in_bounds or self._cursor_scene_pos is None:
+        if (
+            self._is_translating_drawing
+            or not self._drawing_enabled
+            or not self._cursor_in_bounds
+            or self._cursor_scene_pos is None
+        ):
             return
 
         zoom = max(0.001, abs(self.transform().m11()))
@@ -923,7 +971,73 @@ class DrawingGraphicsView(QGraphicsView):
             self._drawing_enabled
             and not self._drawing_blocked
             and event.button() == Qt.MouseButton.LeftButton
+            and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         )
+
+    def _should_begin_drawing_translation(self, event: QMouseEvent) -> bool:
+        return (
+            self._drawing_enabled
+            and not self._drawing_blocked
+            and not self._drawing_image.isNull()
+            and event.button() == Qt.MouseButton.LeftButton
+            and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        )
+
+    def _begin_drawing_translation(self, scene_pos: QPointF) -> None:
+        self._cancel_stroke_state()
+        self._is_translating_drawing = True
+        self._translation_origin = QPointF(scene_pos)
+        self._translation_before = self._drawing_image.copy()
+        self._translation_delta = QPointF()
+        self._cursor_scene_pos = None
+        self._cursor_in_bounds = False
+        self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.viewport().update()
+
+    def _update_drawing_translation(self, scene_pos: QPointF) -> None:
+        if not self._is_translating_drawing or self._translation_before.isNull():
+            return
+        delta_x = round(scene_pos.x() - self._translation_origin.x())
+        delta_y = round(scene_pos.y() - self._translation_origin.y())
+        if self._translation_delta == QPointF(delta_x, delta_y):
+            return
+        self._translation_delta = QPointF(delta_x, delta_y)
+        translated = QImage(
+            self._translation_before.size(),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        translated.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(translated)
+        painter.drawImage(delta_x, delta_y, self._translation_before)
+        painter.end()
+        self._drawing_image = translated
+        self._refresh_drawing_item()
+
+    def _finish_drawing_translation(self, *, emit_change: bool) -> None:
+        if not self._is_translating_drawing:
+            return
+        before = self._translation_before
+        changed = not before.isNull() and before != self._drawing_image
+        self._is_translating_drawing = False
+        self._translation_origin = QPointF()
+        self._translation_before = QImage()
+        self._translation_delta = QPointF()
+        self.viewport().unsetCursor()
+        if changed and emit_change:
+            rect = self._drawing_image.rect()
+            self.drawing_changed.emit("move", rect, before.copy(rect), self._drawing_image.copy(rect))
+
+    def _cancel_drawing_translation(self, *, revert: bool) -> None:
+        if not self._is_translating_drawing:
+            return
+        if revert and not self._translation_before.isNull():
+            self._drawing_image = self._translation_before.copy()
+            self._refresh_drawing_item()
+        self._is_translating_drawing = False
+        self._translation_origin = QPointF()
+        self._translation_before = QImage()
+        self._translation_delta = QPointF()
+        self.viewport().unsetCursor()
 
     def _drawing_bounds_rect(self) -> QRectF:
         return QRectF(0, 0, self._drawing_image.width(), self._drawing_image.height())
@@ -995,7 +1109,7 @@ class DrawingGraphicsView(QGraphicsView):
         if self._waiting_for_first_motion:
             start = self._press_point or point
             self._stroke_path.moveTo(start)
-            self._stroke_path.lineTo(point)
+            self._stroke_path.lineTo(self._point_midpoint(start, point))
             self._previous_point = start
             self._last_draw_point = point
             self._last_input_point = point
@@ -1006,7 +1120,7 @@ class DrawingGraphicsView(QGraphicsView):
                 point,
                 start_pressure=self._press_pressure,
                 end_pressure=pressure,
-                path_already_started=True,
+                add_to_path=False,
             )
             self._last_draw_pressure = pressure
             self._last_input_pressure = pressure
@@ -1033,16 +1147,21 @@ class DrawingGraphicsView(QGraphicsView):
         if self._stroke_points and self._points_are_close(self._stroke_points[-1], point):
             return
 
+        curve_end = self._point_midpoint(self._last_draw_point, point)
+        if self._stroke_path.isEmpty():
+            self._stroke_path.moveTo(self._last_draw_point)
+        self._stroke_path.quadTo(self._last_draw_point, curve_end)
         self._queue_linear_segment(
             self._last_draw_point,
             point,
             start_pressure=self._last_draw_pressure,
             end_pressure=pressure,
+            add_to_path=False,
         )
         self._previous_point = self._last_draw_point
         self._last_draw_point = point
         self._last_draw_pressure = pressure
-        self._stroke_points = [point]
+        self._stroke_points.append(point)
 
     def _queue_linear_segment(
         self,
@@ -1051,13 +1170,13 @@ class DrawingGraphicsView(QGraphicsView):
         *,
         start_pressure: float = 1.0,
         end_pressure: float = 1.0,
-        path_already_started: bool = False,
+        add_to_path: bool = True,
     ) -> None:
         if self._points_are_close(start, end):
             return
-        if self._stroke_path.isEmpty():
-            self._stroke_path.moveTo(start)
-        if not path_already_started:
+        if add_to_path:
+            if self._stroke_path.isEmpty():
+                self._stroke_path.moveTo(start)
             self._stroke_path.lineTo(end)
         if self._drawing_tool == "soft_brush":
             self._soft_renderer.add_capsule(
@@ -1143,14 +1262,12 @@ class DrawingGraphicsView(QGraphicsView):
         if not self._stroke_points:
             self._queue_dot(self._press_point or QPointF())
         else:
-            final_point = self._stroke_points[-1]
-            if not self._points_are_close(self._last_draw_point, final_point):
-                self._queue_quadratic_segment(
-                    self._last_draw_point,
-                    final_point,
-                    final_point,
-                )
-                self._last_draw_point = final_point
+            final_point = self._last_draw_point
+            path_end = self._stroke_path.currentPosition()
+            if not self._points_are_close(path_end, final_point):
+                self._stroke_path.quadTo(final_point, final_point)
+                self._mark_stroke_dirty(path_end, final_point)
+                self._schedule_drawing_preview()
 
         flush_start = perf_counter()
         self._flush_drawing_preview()
@@ -1401,7 +1518,7 @@ class DrawingGraphicsView(QGraphicsView):
         self._square_stroke_mask.fill(Qt.GlobalColor.transparent)
         self._stroke_preview_item.setPixmap(QPixmap())
         self._stroke_preview_item.setOpacity(1.0 if self._drawing_tool == "eraser" else self._brush_opacity)
-        self._stroke_preview_item.show()
+        self._stroke_preview_item.setVisible(self._drawing_layer_visible)
 
     def _refresh_stroke_preview_item(self) -> None:
         if self._stroke_preview_item is None or self._stroke_preview_image.isNull():
@@ -1420,7 +1537,7 @@ class DrawingGraphicsView(QGraphicsView):
             self._stroke_preview_item.setOpacity(self._brush_opacity)
             self._stroke_preview_item.setPixmap(QPixmap.fromImage(self._stroke_preview_image))
             if self._drawing_item is not None:
-                self._drawing_item.show()
+                self._drawing_item.setVisible(self._drawing_layer_visible)
         self.viewport().update()
 
     def _commit_stroke_preview(self) -> tuple[str, QRect, QImage, QImage] | None:
@@ -1449,7 +1566,7 @@ class DrawingGraphicsView(QGraphicsView):
             self._stroke_preview_item.setPixmap(QPixmap())
             self._stroke_preview_item.hide()
         if self._drawing_item is not None:
-            self._drawing_item.show()
+            self._drawing_item.setVisible(self._drawing_layer_visible)
 
     def _stamp_spacing(self) -> float:
         return max(0.25, self._brush_size * 0.08)
@@ -1675,7 +1792,7 @@ class DrawingGraphicsView(QGraphicsView):
         return min(1.5, max(0.75, self._brush_size * 0.08))
 
     @staticmethod
-    def _midpoint(first: QPointF, second: QPointF) -> QPointF:
+    def _point_midpoint(first: QPointF, second: QPointF) -> QPointF:
         return QPointF((first.x() + second.x()) / 2, (first.y() + second.y()) / 2)
 
     @staticmethod
@@ -1763,6 +1880,7 @@ class CanvasView(DrawingGraphicsView):
         self._grid_color = QColor("#2563eb")
         self._grid_opacity = 0.4
         self._content_scale = 1
+        self._scaled_pixmap_cache: dict[tuple[int, int], QPixmap] = {}
 
         self.setBackgroundBrush(QColor("#111827"))
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1804,7 +1922,10 @@ class CanvasView(DrawingGraphicsView):
         self._refresh_display_pixmaps()
 
     def set_onion_skin_enabled(self, enabled: bool) -> None:
+        changed = self._onion_skin_enabled != enabled
         self._onion_skin_enabled = enabled
+        if changed and enabled:
+            self._refresh_display_pixmaps()
         self._sync_onion_skin_state()
 
     def set_onion_skin_opacity(self, opacity: float) -> None:
@@ -1906,9 +2027,9 @@ class CanvasView(DrawingGraphicsView):
         )
 
     def _refresh_display_pixmaps(self) -> None:
-        previous_pixmap = self._scaled_pixmap(self._previous_source_pixmap)
+        previous_pixmap = self._scaled_pixmap(self._previous_source_pixmap) if self._onion_skin_enabled else QPixmap()
         current_pixmap = self._scaled_pixmap(self._current_source_pixmap)
-        next_pixmap = self._scaled_pixmap(self._next_source_pixmap)
+        next_pixmap = self._scaled_pixmap(self._next_source_pixmap) if self._onion_skin_enabled else QPixmap()
 
         self._previous_item.setPixmap(self._tint_pixmap_multiply(previous_pixmap, self._previous_onion_color))
         self._current_item.setPixmap(current_pixmap)
@@ -1930,15 +2051,24 @@ class CanvasView(DrawingGraphicsView):
         if pixmap.isNull() or self._content_scale == 1:
             return pixmap
 
+        cache_key = (pixmap.cacheKey(), self._content_scale)
+        cached = self._scaled_pixmap_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         scaled_size = QSize(
             pixmap.width() * self._content_scale,
             pixmap.height() * self._content_scale,
         )
-        return pixmap.scaled(
+        scaled = pixmap.scaled(
             scaled_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        if len(self._scaled_pixmap_cache) >= 48:
+            self._scaled_pixmap_cache.clear()
+        self._scaled_pixmap_cache[cache_key] = scaled
+        return scaled
 
     def _effective_grid_size(self) -> int:
         return max(1, self._grid_size * self._content_scale)
@@ -1972,9 +2102,14 @@ class BlankCanvasView(DrawingGraphicsView):
         self.fit_to_view()
 
     def set_canvas_size(self, width: int, height: int, grid_scale: int = 1) -> None:
-        self._grid_scale = max(1, grid_scale)
-        self._canvas_item.setRect(0, 0, max(1, width), max(1, height))
-        self.set_drawing_layer_size(max(1, width), max(1, height))
+        width = max(1, width)
+        height = max(1, height)
+        grid_scale = max(1, grid_scale)
+        if self._canvas_item.rect().size().toSize() == QSize(width, height) and self._grid_scale == grid_scale:
+            return
+        self._grid_scale = grid_scale
+        self._canvas_item.setRect(0, 0, width, height)
+        self.set_drawing_layer_size(width, height)
         self.scene().setSceneRect(self._canvas_item.boundingRect())
         self.viewport().update()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QRect
@@ -57,14 +58,14 @@ class HistoryMemoryManager:
         self.limit_bytes = max(0, int(limit_bytes))
         self.total_bytes = 0
         self._next_sequence = 1
-        self._order: deque[tuple[int, int]] = deque()
+        self._order: deque[tuple[Hashable, int]] = deque()
 
     def commit(
         self,
-        frame_index: int,
+        frame_index: Hashable,
         history: FrameDrawingHistory,
         operation: DrawingOperation,
-        histories: dict[int, FrameDrawingHistory],
+        histories: Mapping[Hashable, FrameDrawingHistory],
     ) -> None:
         operation.sequence = self._next_sequence
         self._next_sequence += 1
@@ -78,7 +79,7 @@ class HistoryMemoryManager:
         self._next_sequence = 1
         self._order.clear()
 
-    def recalculate(self, histories: dict[int, FrameDrawingHistory]) -> None:
+    def recalculate(self, histories: Mapping[Hashable, FrameDrawingHistory]) -> None:
         self.total_bytes = sum(
             operation.memory_bytes
             for history in histories.values()
@@ -86,7 +87,25 @@ class HistoryMemoryManager:
         )
         self.enforce_limit(histories)
 
-    def enforce_limit(self, histories: dict[int, FrameDrawingHistory]) -> None:
+    def reindex(self, histories: Mapping[Hashable, FrameDrawingHistory]) -> None:
+        """Rebuild frame-index references after timeline insertions or moves."""
+
+        operations = [
+            (operation.sequence, frame_index)
+            for frame_index, history in histories.items()
+            for operation in (*history.undo, *history.redo)
+            if operation.sequence > 0
+        ]
+        operations.sort()
+        self._order = deque((frame_index, sequence) for sequence, frame_index in operations)
+        self.total_bytes = sum(
+            operation.memory_bytes
+            for history in histories.values()
+            for operation in (*history.undo, *history.redo)
+        )
+        self.enforce_limit(histories)
+
+    def enforce_limit(self, histories: Mapping[Hashable, FrameDrawingHistory]) -> None:
         while self.total_bytes > self.limit_bytes and self._order:
             frame_index, sequence = self._order.popleft()
             history = histories.get(frame_index)

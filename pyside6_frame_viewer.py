@@ -5,13 +5,16 @@ import io
 import json
 import sys
 import zipfile
+from collections.abc import MutableMapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Callable
+from uuid import uuid4
 
-from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QPoint, QRect, QSettings, Qt, QTimer, QSize
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QPoint, QRect, QSettings, Qt, QTimer, QSize, Signal
+from PySide6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
@@ -32,10 +36,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QPushButton,
+    QScrollArea,
     QSlider,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -50,6 +58,64 @@ from history import FrameDrawingHistory, HistoryMemoryManager, DrawingOperation
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_FRAME_DIR = APP_DIR / "work" / "demo_frames"
 PROJECT_SUFFIX = ".giftrace"
+
+
+@dataclass
+class FrameData:
+    """All state that belongs to one timeline frame, identified independently of its position."""
+
+    frame_id: str
+    path: Path
+    duration: int = 120
+    exposure: int = 1
+    reference_image: QImage | None = None
+    drawing: QImage | None = None
+    history: FrameDrawingHistory | None = None
+    thumbnail_reference: QImage | None = None
+    pixmap: QPixmap | None = None
+    thumbnail_cache: dict[str, QPixmap] = field(default_factory=dict)
+    thumbnail_dirty: bool = True
+
+
+@dataclass
+class LayerGroup:
+    """One independently editable animation layer, keyed by stable frame ids."""
+
+    group_id: str
+    name: str
+    visible: bool = True
+    drawings: dict[str, QImage] = field(default_factory=dict)
+    histories: dict[str, FrameDrawingHistory] = field(default_factory=dict)
+
+
+class FrameFieldMapping(MutableMapping[int, object]):
+    """Compatibility view over one FrameData field; it never owns a second copy of state."""
+
+    def __init__(self, owner: "FrameViewerWindow", field_name: str) -> None:
+        self._owner = owner
+        self._field_name = field_name
+
+    def __getitem__(self, key: int):
+        value = getattr(self._owner.frames[key], self._field_name)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: int, value) -> None:
+        setattr(self._owner.frames[key], self._field_name, value)
+
+    def __delitem__(self, key: int) -> None:
+        setattr(self._owner.frames[key], self._field_name, None)
+
+    def __iter__(self):
+        return (index for index, frame in enumerate(self._owner.frames) if getattr(frame, self._field_name) is not None)
+
+    def __len__(self) -> int:
+        return sum(getattr(frame, self._field_name) is not None for frame in self._owner.frames)
+
+    def clear(self) -> None:
+        for frame in self._owner.frames:
+            setattr(frame, self._field_name, None)
 
 
 def ensure_demo_png_sequence(frame_dir: Path, count: int = 12) -> list[Path]:
@@ -265,35 +331,346 @@ class ReferenceFloatWindow(QWidget):
         return Qt.CursorShape.ArrowCursor
 
 
+class TimelineListWidget(QListWidget):
+    """Timeline projection with one custom, frame-id based drag-and-drop path."""
+
+    FRAME_MIME_TYPE = "application/x-gif-trace-frame-id"
+
+    drag_started = Signal()
+    frame_move_requested = Signal(str, str, bool)
+    drag_finished = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._selected_frame_id_before_drag = ""
+        self._insert_x: int | None = None
+        self._pending_move: tuple[str, str, bool] | None = None
+
+    def startDrag(self, supported_actions) -> None:  # type: ignore[override]
+        current = self.currentItem()
+        self._selected_frame_id_before_drag = str(current.data(Qt.ItemDataRole.UserRole)) if current is not None else ""
+        if not self._selected_frame_id_before_drag:
+            return
+        self._pending_move = None
+        self.drag_started.emit()
+        try:
+            mime_data = QMimeData()
+            mime_data.setData(self.FRAME_MIME_TYPE, self._selected_frame_id_before_drag.encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(mime_data)
+            drag.setPixmap(current.icon().pixmap(self.iconSize()))
+            drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        finally:
+            pending_move = self._pending_move
+            self._pending_move = None
+            self._selected_frame_id_before_drag = ""
+            self._set_insert_x(None)
+            self.drag_finished.emit()
+        if pending_move is not None:
+            self.frame_move_requested.emit(*pending_move)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        source_id = self._frame_id_from_event(event)
+        if not source_id or source_id != self._selected_frame_id_before_drag or self._item_for_frame_id(source_id) is None:
+            self._set_insert_x(None)
+            event.ignore()
+            return
+        position = event.position().toPoint()
+        anchor_id, place_after = self._anchor_for_position(position)
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        if anchor_id != source_id:
+            self._pending_move = (source_id, anchor_id, place_after)
+        self._set_insert_x(None)
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if self._frame_id_from_event(event) == self._selected_frame_id_before_drag:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._frame_id_from_event(event) != self._selected_frame_id_before_drag:
+            self._set_insert_x(None)
+            event.ignore()
+            return
+        self._set_insert_x(self._insert_x_for_position(event.position().toPoint()))
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self._set_insert_x(None)
+        event.accept()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._insert_x is None:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(QPen(QColor("#2563eb"), 2))
+        painter.drawLine(self._insert_x, 4, self._insert_x, self.viewport().height() - 4)
+        painter.end()
+
+    def _insert_x_for_position(self, position: QPoint) -> int:
+        anchor_id, place_after = self._anchor_for_position(position)
+        item = self._item_for_frame_id(anchor_id) if anchor_id else None
+        if item is None:
+            return 4 if self.count() == 0 else self.visualItemRect(self.item(self.count() - 1)).right() + 4
+        rect = self.visualItemRect(item)
+        return rect.right() + 1 if place_after else rect.left()
+
+    def _anchor_for_position(self, position: QPoint) -> tuple[str, bool]:
+        target_item = self.itemAt(position)
+        if target_item is not None:
+            target_rect = self.visualItemRect(target_item)
+            return (
+                str(target_item.data(Qt.ItemDataRole.UserRole)),
+                position.x() >= target_rect.center().x(),
+            )
+        for index in range(self.count()):
+            item = self.item(index)
+            if position.x() < self.visualItemRect(item).center().x():
+                return str(item.data(Qt.ItemDataRole.UserRole)), False
+        return "", True
+
+    def _set_insert_x(self, value: int | None) -> None:
+        if self._insert_x == value:
+            return
+        self._insert_x = value
+        self.viewport().update()
+
+    def _item_for_frame_id(self, frame_id: str) -> QListWidgetItem | None:
+        for index in range(self.count()):
+            item = self.item(index)
+            if str(item.data(Qt.ItemDataRole.UserRole)) == frame_id:
+                return item
+        return None
+
+    def _frame_id_from_event(self, event) -> str:
+        if event.source() is not self or not event.mimeData().hasFormat(self.FRAME_MIME_TYPE):
+            return ""
+        return bytes(event.mimeData().data(self.FRAME_MIME_TYPE)).decode("utf-8", errors="ignore")
+
+
+class TimelineFrameDelegate(QStyledItemDelegate):
+    """Paint fixed-size thumbnails; item width controls only their horizontal spacing."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
+        painter.save()
+        rect = option.rect
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            painter.fillRect(rect, QColor(37, 99, 235, 28))
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        if isinstance(icon, QIcon) and not icon.isNull():
+            view = option.widget
+            icon_size = view.iconSize() if isinstance(view, QListWidget) else QSize(96, 54)
+            pixmap = icon.pixmap(icon_size)
+            icon_rect = QRect(
+                rect.center().x() - icon_size.width() // 2,
+                rect.center().y() - icon_size.height() // 2,
+                icon_size.width(),
+                icon_size.height(),
+            )
+            painter.drawPixmap(icon_rect, pixmap)
+            painter.setPen(QPen(QColor("#2563eb") if selected else QColor("#374151"), 2 if selected else 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(icon_rect.adjusted(-1, -1, 1, 1))
+        painter.setPen(QPen(QColor("#64748b"), 1))
+        painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
+        painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+        painter.restore()
+
+
+class TimelineRuler(QWidget):
+    """A fixed header that projects the active timeline's frame sequence indefinitely to the right."""
+
+    def __init__(self, owner: "FrameViewerWindow") -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self._timeline: TimelineListWidget | None = None
+        self._drag_handle: str | None = None
+        self.setFixedHeight(26)
+        self.setMinimumWidth(1)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("点击序号切换帧")
+
+    def set_timeline(self, timeline: TimelineListWidget | None) -> None:
+        if timeline is self._timeline:
+            self.update()
+            return
+        if self._timeline is not None:
+            try:
+                self._timeline.horizontalScrollBar().valueChanged.disconnect(self._scroll_changed)
+            except (RuntimeError, TypeError):
+                pass
+        self._timeline = timeline
+        if timeline is not None:
+            timeline.horizontalScrollBar().valueChanged.connect(self._scroll_changed)
+        self.update()
+
+    def _scroll_changed(self, _value: int) -> None:
+        self.update()
+
+    def _sequence_geometry(self) -> tuple[float, int]:
+        timeline = self._timeline
+        if timeline is None:
+            return 0.0, 108
+        span = max(1, timeline.gridSize().width())
+        if timeline.count():
+            first_rect = timeline.visualItemRect(timeline.item(0))
+            if first_rect.isValid():
+                return float(first_rect.center().x()), span
+        return span / 2.0 - timeline.horizontalScrollBar().value(), span
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0f172a"))
+        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        base_x, span = self._sequence_geometry()
+        range_start_x = round(base_x + (self._owner.playback_range_start - 0.5) * span)
+        range_end_x = round(base_x + (self._owner.playback_range_end + 0.5) * span)
+        painter.fillRect(
+            QRect(min(range_start_x, range_end_x), 0, abs(range_end_x - range_start_x) + 1, self.height()),
+            QColor(37, 99, 235, 72),
+        )
+        first_offset = min(0, int((0 - base_x) // span) - 1)
+        last_offset = int((self.width() - base_x) // span) + 2
+        painter.setPen(QPen(QColor("#475569"), 1))
+        for offset in range(first_offset, last_offset + 2):
+            boundary_x = round(base_x + (offset - 0.5) * span)
+            painter.drawLine(boundary_x, 0, boundary_x, self.height() - 1)
+        current = self._owner.current_index
+        for offset in range(first_offset, last_offset + 1):
+            sequence = offset + 1
+            if sequence < 1:
+                continue
+            x = round(base_x + offset * span)
+            text_rect = QRect(x - max(18, span // 2), 1, max(36, span), self.height() - 3)
+            if offset == current:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#2563eb"))
+                painter.drawRoundedRect(text_rect.adjusted(3, 1, -3, -1), 4, 4)
+                painter.setPen(QColor("#ffffff"))
+                font = painter.font()
+                font.setBold(True)
+                painter.setFont(font)
+            else:
+                painter.setPen(QColor("#cbd5e1"))
+                font = painter.font()
+                font.setBold(False)
+                painter.setFont(font)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, str(sequence))
+        for x in (range_start_x, range_end_x):
+            painter.setPen(QPen(QColor("#f59e0b"), 2))
+            painter.drawLine(x, 0, x, self.height() - 1)
+            painter.fillRect(QRect(x - 4, 0, 9, 5), QColor("#f59e0b"))
+            painter.fillRect(QRect(x - 4, self.height() - 5, 9, 5), QColor("#f59e0b"))
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        timeline = self._timeline
+        if timeline is None or event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        base_x, span = self._sequence_geometry()
+        start_x = base_x + (self._owner.playback_range_start - 0.5) * span
+        end_x = base_x + (self._owner.playback_range_end + 0.5) * span
+        position_x = event.position().x()
+        if abs(position_x - start_x) <= 9 or abs(position_x - end_x) <= 9:
+            self._drag_handle = "start" if abs(position_x - start_x) <= abs(position_x - end_x) else "end"
+            self._move_range_handle(position_x)
+            event.accept()
+            return
+        index = round((event.position().x() - base_x) / span)
+        if 0 <= index < timeline.count():
+            timeline.setCurrentRow(index)
+            timeline.scrollToItem(timeline.item(index), QAbstractItemView.ScrollHint.EnsureVisible)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self._drag_handle is not None:
+            self._move_range_handle(event.position().x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self._drag_handle is not None:
+            self._move_range_handle(event.position().x())
+            self._drag_handle = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _move_range_handle(self, position_x: float) -> None:
+        timeline = self._timeline
+        if timeline is None or not self._owner.frames or self._drag_handle is None:
+            return
+        base_x, span = self._sequence_geometry()
+        if self._drag_handle == "start":
+            index = max(0, min(len(self._owner.frames) - 1, round((position_x - base_x) / span + 0.5)))
+            self._owner.set_playback_range(min(index, self._owner.playback_range_end), self._owner.playback_range_end)
+        else:
+            index = max(0, min(len(self._owner.frames) - 1, round((position_x - base_x) / span - 0.5)))
+            self._owner.set_playback_range(self._owner.playback_range_start, max(index, self._owner.playback_range_start))
+
 class FrameViewerWindow(QMainWindow):
     def __init__(self, frame_dir: Path = DEFAULT_FRAME_DIR) -> None:
         super().__init__()
         self.setWindowTitle("GIF Reference Tracing Viewer")
         self.resize(1280, 820)
 
-        self.frame_paths = ensure_demo_png_sequence(frame_dir)
-        self.frame_durations = [120 for _ in self.frame_paths]
+        self.frames = [
+            FrameData(frame_id=uuid4().hex, path=path)
+            for path in ensure_demo_png_sequence(frame_dir)
+        ]
         self.current_gif_path: Path | None = None
         self.current_project_path: Path | None = None
         self.current_index = 0
+        self.playback_range_start = 0
+        self.playback_range_end = max(0, len(self.frames) - 1)
         self.practice_scale = 3
         self.current_drawing_size = QSize(1, 1)
-        self.drawing_layers: dict[int, QImage] = {}
-        self.frame_histories: dict[int, FrameDrawingHistory] = {}
+        self.drawing_layers = FrameFieldMapping(self, "drawing")
+        self.frame_histories = FrameFieldMapping(self, "history")
+        self.layer_groups = [LayerGroup(uuid4().hex, "图层组 1")]
+        self.active_layer_group_id = self.layer_groups[0].group_id
+        self._updating_layer_list = False
         self._history_memory = HistoryMemoryManager()
-        self._pending_stroke_before: dict[int, tuple[str, QImage]] = {}
+        self._pending_stroke_before: dict[str, tuple[str, QImage]] = {}
+        self._drawing_operation_context: dict[object, tuple[str, str]] = {}
         self._syncing_drawing = False
         self._settings = QSettings("GIF Reference Tracing Viewer", "GIF Reference Tracing Viewer")
         self.thumbnail_display_mode = str(self._settings.value("thumbnail_display_mode", "composite"))
-        self._thumbnail_cache: dict[tuple[int, str], QPixmap] = {}
-        self._thumbnail_dirty: set[int] = set()
-        self._thumbnail_reference_cache: dict[int, QImage] = {}
-        self._project_reference_images: dict[int, QImage] = {}
+        self._thumbnail_cache: dict[tuple[str, str], QPixmap] = {}
+        self._thumbnail_dirty: set[str] = set()
+        self._thumbnail_generation = 0
+        self._thumbnail_reference_cache = FrameFieldMapping(self, "thumbnail_reference")
+        self._reference_images_by_index = FrameFieldMapping(self, "reference_image")
+        self._frame_pixmap_cache = FrameFieldMapping(self, "pixmap")
+        self._last_frame_switch_at = 0.0
+        self._pending_timeline_frame_id: str | None = None
         self.playback_fps = max(1, min(60, int(self._settings.value("playback_fps", 12))))
 
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(self._playback_interval())
         self.play_timer.timeout.connect(self.advance_playback)
+        self._playback_exposure_tick = 0
+        self._frame_switch_timer = QTimer(self)
+        self._frame_switch_timer.setSingleShot(True)
+        self._frame_switch_timer.timeout.connect(self._apply_pending_timeline_frame)
+        self._frame_preload_timer = QTimer(self)
+        self._frame_preload_timer.setSingleShot(True)
+        self._frame_preload_timer.timeout.connect(self._preload_adjacent_frames)
+        self._pending_view_mode: int | None = None
+        self._view_switch_timer = QTimer(self)
+        self._view_switch_timer.setSingleShot(True)
+        self._view_switch_timer.timeout.connect(self._apply_pending_view_mode)
 
         self.overlay_canvas = CanvasView()
         self.compare_reference_canvas = CanvasView()
@@ -332,28 +709,50 @@ class FrameViewerWindow(QMainWindow):
         self.compare_reference_canvas.set_tracing_visible(False)
         self.reference_only_canvas.set_tracing_visible(False)
 
-        self.timeline = QListWidget()
+        self._timeline_drag_active = False
+        self.timeline = TimelineListWidget()
         self.timeline.setViewMode(QListView.ViewMode.IconMode)
         self.timeline.setFlow(QListView.Flow.LeftToRight)
         self.timeline.setWrapping(False)
         self.timeline.setMovement(QListView.Movement.Static)
+        # No QListWidget move path is used. TimelineListWidget creates its own
+        # QDrag and only projects the atomically reordered FrameData list.
+        self.timeline.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.timeline.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.timeline.setDragEnabled(True)
+        self.timeline.setAcceptDrops(True)
+        self.timeline.viewport().setAcceptDrops(True)
+        self.timeline.setDropIndicatorShown(False)
+        self.timeline.setDragDropOverwriteMode(False)
         self.timeline.setResizeMode(QListView.ResizeMode.Adjust)
         self.timeline.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.timeline.setIconSize(QSize(96, 54))
         self.timeline.setGridSize(QSize(108, 82))
         self.timeline.setSpacing(4)
-        self.timeline.setFixedHeight(104)
+        self.timeline.setMinimumHeight(88)
+        self.timeline.setMaximumHeight(132)
+        self.timeline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.timeline.setStyleSheet(
             "QListWidget::item { border: 2px solid transparent; padding: 3px; }"
             "QListWidget::item:selected {"
             " background: #d1d5db; border-color: #6b7280; color: #111827; }"
         )
-        self.timeline.currentRowChanged.connect(self.set_current_frame)
+        self.timeline.setItemDelegate(TimelineFrameDelegate(self.timeline))
+        self.timeline.currentRowChanged.connect(self._timeline_row_changed)
+        self.timeline.drag_started.connect(self._set_timeline_drag_active)
+        self.timeline.drag_finished.connect(self._clear_timeline_drag_active)
+        self.timeline.frame_move_requested.connect(self._timeline_frame_move_requested)
+        self.timeline.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.timeline.customContextMenuRequested.connect(self._show_timeline_context_menu)
         self.timeline.horizontalScrollBar().valueChanged.connect(self._schedule_visible_thumbnail_refresh)
         self.timeline.viewport().installEventFilter(self)
+        self.group_timeline_widgets: dict[str, TimelineListWidget] = {}
+        self.group_timeline_row_hosts: dict[str, QWidget] = {}
+        self._primary_timeline_group_id = self.active_layer_group_id
         self._thumbnail_refresh_timer = QTimer(self)
         self._thumbnail_refresh_timer.setSingleShot(True)
         self._thumbnail_refresh_timer.timeout.connect(self._refresh_visible_thumbnails)
+        self._pending_thumbnail_display_mode: str | None = None
 
         self.thumbnail_display_combo = QComboBox()
         self.thumbnail_display_combo.addItem("参考帧", "reference")
@@ -365,6 +764,18 @@ class FrameViewerWindow(QMainWindow):
         )
         self.thumbnail_display_mode = self.thumbnail_display_combo.currentData()
         self.thumbnail_display_combo.currentIndexChanged.connect(self.set_thumbnail_display_mode)
+
+        self.timeline_zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_zoom_slider.setRange(50, 200)
+        self.timeline_zoom_slider.setSingleStep(5)
+        self.timeline_zoom_slider.setPageStep(25)
+        self.timeline_zoom_slider.setFixedWidth(150)
+        saved_timeline_zoom = max(50, min(200, int(self._settings.value("timeline_zoom", 100))))
+        self.timeline_zoom_slider.setValue(saved_timeline_zoom)
+        self.timeline_zoom_slider.setToolTip("拖动调整时间轴帧缩略图显示倍率")
+        self.timeline_zoom_value_label = QLabel(f"{saved_timeline_zoom}%")
+        self.timeline_zoom_value_label.setMinimumWidth(42)
+        self.timeline_zoom_slider.valueChanged.connect(self.set_timeline_zoom)
 
         self.import_gif_button = QPushButton("导入 GIF")
         self.import_gif_button.clicked.connect(self.import_gif)
@@ -593,7 +1004,7 @@ class FrameViewerWindow(QMainWindow):
         self.view_mode_combo = QComboBox()
         self.view_mode_combo.addItems(["叠加模式", "左右对比模式", "只看参考", "只看临摹", "悬浮参考"])
         self.view_mode_combo.setCurrentIndex(1)
-        self.view_mode_combo.currentIndexChanged.connect(self.set_view_mode)
+        self.view_mode_combo.currentIndexChanged.connect(self.request_view_mode)
 
         self.settings_button = QPushButton("画布设置")
         self.settings_button.clicked.connect(self.toggle_settings_panel)
@@ -603,6 +1014,8 @@ class FrameViewerWindow(QMainWindow):
 
         self.onion_skin_checkbox = QCheckBox("Onion Skin")
         self.onion_skin_checkbox.toggled.connect(self.set_onion_skin_enabled)
+        self.onion_loop_checkbox = QCheckBox("首尾帧洋葱皮互通")
+        self.onion_loop_checkbox.toggled.connect(self.set_onion_loop_enabled)
 
         self.previous_onion_color_combo = self._create_onion_color_combo()
         self.previous_onion_color_combo.setCurrentIndex(0)
@@ -617,6 +1030,17 @@ class FrameViewerWindow(QMainWindow):
         self.onion_opacity_slider.setRange(0, 100)
         self.onion_opacity_slider.setValue(100)
         self.onion_opacity_slider.valueChanged.connect(self.set_onion_skin_opacity)
+
+        self.layer_group_list = QListWidget()
+        self.layer_group_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.layer_group_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.layer_group_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.layer_group_list.setToolTip("拖拽调整显示顺序；双击名称可重命名")
+        self.layer_group_list.currentItemChanged.connect(self._layer_group_selection_changed)
+        self.layer_group_list.itemChanged.connect(self._layer_group_item_changed)
+        self.layer_group_list.model().rowsMoved.connect(self._layer_group_rows_moved)
+        self.add_layer_group_button = QPushButton("＋ 新建图层组")
+        self.add_layer_group_button.clicked.connect(self.add_layer_group)
 
         self._build_ui()
         app = QApplication.instance()
@@ -635,6 +1059,59 @@ class FrameViewerWindow(QMainWindow):
 
         self._update_play_icon()
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        for timer in (
+            self.play_timer,
+            self._frame_switch_timer,
+            self._frame_preload_timer,
+            self._view_switch_timer,
+            self._thumbnail_refresh_timer,
+        ):
+            timer.stop()
+        self.reference_float_window.close()
+        super().closeEvent(event)
+
+    @property
+    def frame_paths(self) -> list[Path]:
+        return [frame.path for frame in self.frames]
+
+    @frame_paths.setter
+    def frame_paths(self, paths: list[Path]) -> None:
+        self.frames = [FrameData(frame_id=uuid4().hex, path=Path(path)) for path in paths]
+        self.playback_range_start = 0
+        self.playback_range_end = max(0, len(self.frames) - 1)
+        if hasattr(self, "layer_groups"):
+            self._reset_layer_groups()
+
+    @property
+    def frame_durations(self) -> list[int]:
+        return [frame.duration for frame in self.frames]
+
+    @frame_durations.setter
+    def frame_durations(self, values: list[int]) -> None:
+        for frame, value in zip(self.frames, values):
+            frame.duration = max(1, int(value))
+
+    @property
+    def frame_exposures(self) -> list[int]:
+        return [frame.exposure for frame in self.frames]
+
+    @frame_exposures.setter
+    def frame_exposures(self, values: list[int]) -> None:
+        for frame, value in zip(self.frames, values):
+            frame.exposure = max(1, int(value))
+
+    @property
+    def _project_reference_images(self) -> FrameFieldMapping:
+        return self._reference_images_by_index
+
+    @_project_reference_images.setter
+    def _project_reference_images(self, values: dict[int, QImage]) -> None:
+        self._reference_images_by_index.clear()
+        for index, image in values.items():
+            if 0 <= index < len(self.frames):
+                self.frames[index].reference_image = image
+
     def _build_ui(self) -> None:
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._create_top_toolbar())
 
@@ -649,8 +1126,15 @@ class FrameViewerWindow(QMainWindow):
         central = QWidget()
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(6, 6, 6, 6)
-        central_layout.addWidget(self.view_stack, 1)
-        central_layout.addWidget(self._create_timeline_panel())
+        self.canvas_timeline_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.canvas_timeline_splitter.setChildrenCollapsible(False)
+        self.canvas_timeline_splitter.setHandleWidth(7)
+        self.canvas_timeline_splitter.addWidget(self._create_canvas_workspace())
+        self.canvas_timeline_splitter.addWidget(self._create_timeline_panel())
+        self.canvas_timeline_splitter.setStretchFactor(0, 1)
+        self.canvas_timeline_splitter.setStretchFactor(1, 0)
+        self.canvas_timeline_splitter.setSizes([580, 220])
+        central_layout.addWidget(self.canvas_timeline_splitter, 1)
         self.setCentralWidget(central)
 
         self.settings_dock = QDockWidget("画布设置", self)
@@ -658,6 +1142,348 @@ class FrameViewerWindow(QMainWindow):
         self.settings_dock.setWidget(self._create_settings_panel())
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.settings_dock)
         self.settings_dock.hide()
+
+    def _create_canvas_workspace(self) -> QWidget:
+        workspace = QWidget()
+        layout = QHBoxLayout(workspace)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.view_stack, 1)
+
+        layer_panel = QGroupBox("画布图层组")
+        layer_panel.setFixedWidth(210)
+        layer_layout = QVBoxLayout(layer_panel)
+        layer_layout.setContentsMargins(8, 8, 8, 8)
+        layer_layout.addWidget(self.layer_group_list, 1)
+        layer_layout.addWidget(self.add_layer_group_button)
+        layout.addWidget(layer_panel)
+        self._rebuild_layer_group_list()
+        return workspace
+
+    def _reset_layer_groups(self) -> None:
+        self.layer_groups = [LayerGroup(uuid4().hex, "图层组 1")]
+        self.active_layer_group_id = self.layer_groups[0].group_id
+        self._pending_stroke_before.clear()
+        self._drawing_operation_context.clear()
+        if hasattr(self, "layer_group_list"):
+            self._rebuild_layer_group_list()
+        if hasattr(self, "timeline_rows_layout"):
+            self._rebuild_group_timeline_rows()
+
+    def _active_layer_group(self) -> LayerGroup:
+        return next(
+            (group for group in self.layer_groups if group.group_id == self.active_layer_group_id),
+            self.layer_groups[0],
+        )
+
+    def _rebuild_layer_group_list(self) -> None:
+        self._updating_layer_list = True
+        try:
+            self.layer_group_list.clear()
+            active_item = None
+            for group in self.layer_groups:
+                item = QListWidgetItem(group.name)
+                item.setData(Qt.ItemDataRole.UserRole, group.group_id)
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsEditable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                item.setCheckState(Qt.CheckState.Checked if group.visible else Qt.CheckState.Unchecked)
+                self.layer_group_list.addItem(item)
+                if group.group_id == self.active_layer_group_id:
+                    active_item = item
+            if active_item is not None:
+                self.layer_group_list.setCurrentItem(active_item)
+        finally:
+            self._updating_layer_list = False
+
+    def add_layer_group(self) -> None:
+        number = 1
+        names = {group.name for group in self.layer_groups}
+        while f"图层组 {number}" in names:
+            number += 1
+        group = LayerGroup(uuid4().hex, f"图层组 {number}")
+        self.layer_groups.insert(0, group)
+        self._rebuild_layer_group_list()
+        item = self.layer_group_list.item(0)
+        self.layer_group_list.setCurrentItem(item)
+        self.layer_group_list.editItem(item)
+        self._rebuild_group_timeline_rows()
+
+    def _store_active_layer_group(self) -> None:
+        group = self._active_layer_group()
+        group.drawings = {
+            frame.frame_id: frame.drawing
+            for frame in self.frames
+            if frame.drawing is not None and not frame.drawing.isNull()
+        }
+        group.histories = {
+            frame.frame_id: frame.history
+            for frame in self.frames
+            if frame.history is not None
+        }
+
+    def _activate_layer_group(self, group_id: str, *, focus_timeline: bool = True) -> None:
+        if group_id == self.active_layer_group_id:
+            self.sync_drawing_layer_to_views()
+            self._update_timeline_group_highlight()
+            if focus_timeline:
+                self._focus_active_group_timeline()
+            return
+        target = next((group for group in self.layer_groups if group.group_id == group_id), None)
+        if target is None:
+            return
+        self._store_active_layer_group()
+        self.active_layer_group_id = target.group_id
+        for frame in self.frames:
+            frame.drawing = target.drawings.get(frame.frame_id)
+            frame.history = target.histories.get(frame.frame_id)
+        self._pending_stroke_before.clear()
+        self._history_memory.reindex(self._histories_by_id())
+        self.sync_drawing_layer_to_views()
+        self._update_timeline_group_highlight()
+        if focus_timeline:
+            self._focus_active_group_timeline()
+
+    def _layer_group_selection_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if self._updating_layer_list or current is None:
+            return
+        self._activate_layer_group(str(current.data(Qt.ItemDataRole.UserRole)))
+
+    def _layer_group_item_changed(self, item: QListWidgetItem) -> None:
+        if self._updating_layer_list:
+            return
+        group_id = str(item.data(Qt.ItemDataRole.UserRole))
+        group = next((candidate for candidate in self.layer_groups if candidate.group_id == group_id), None)
+        if group is None:
+            return
+        cleaned_name = item.text().strip()
+        if not cleaned_name:
+            self._updating_layer_list = True
+            item.setText(group.name)
+            self._updating_layer_list = False
+        else:
+            group.name = cleaned_name
+        group.visible = item.checkState() == Qt.CheckState.Checked
+        self.sync_drawing_layer_to_views()
+        self._mark_all_thumbnails_dirty()
+        self._rebuild_group_timeline_rows()
+
+    def _layer_group_rows_moved(self, *_args) -> None:
+        if self._updating_layer_list:
+            return
+        groups_by_id = {group.group_id: group for group in self.layer_groups}
+        ordered_ids = [
+            str(self.layer_group_list.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.layer_group_list.count())
+        ]
+        if len(ordered_ids) == len(groups_by_id) and set(ordered_ids) == set(groups_by_id):
+            self.layer_groups = [groups_by_id[group_id] for group_id in ordered_ids]
+            self.sync_drawing_layer_to_views()
+            self._mark_all_thumbnails_dirty()
+            self._rebuild_group_timeline_rows()
+
+    def _configure_group_timeline(self, timeline: TimelineListWidget) -> None:
+        timeline.setViewMode(QListView.ViewMode.IconMode)
+        timeline.setFlow(QListView.Flow.LeftToRight)
+        timeline.setWrapping(False)
+        timeline.setMovement(QListView.Movement.Static)
+        timeline.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        timeline.setDefaultDropAction(Qt.DropAction.MoveAction)
+        timeline.setDragEnabled(True)
+        timeline.setAcceptDrops(True)
+        timeline.viewport().setAcceptDrops(True)
+        timeline.setDropIndicatorShown(False)
+        timeline.setDragDropOverwriteMode(False)
+        timeline.setResizeMode(QListView.ResizeMode.Adjust)
+        timeline.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        timeline.setIconSize(self.timeline.iconSize())
+        timeline.setGridSize(self.timeline.gridSize())
+        timeline.setSpacing(self.timeline.spacing())
+        timeline.setMinimumHeight(88)
+        timeline.setMaximumHeight(132)
+        timeline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        timeline.setStyleSheet(self.timeline.styleSheet())
+        timeline.setItemDelegate(TimelineFrameDelegate(timeline))
+
+    def _rebuild_group_timeline_rows(self) -> None:
+        if not hasattr(self, "timeline_rows_layout"):
+            return
+        self.timeline.setParent(None)
+        while self.timeline_rows_layout.count():
+            layout_item = self.timeline_rows_layout.takeAt(0)
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.group_timeline_widgets = {}
+        self.group_timeline_row_hosts = {}
+        self.group_timeline_visibility_checks: dict[str, QCheckBox] = {}
+        selected_frame_id = self.frames[self.current_index].frame_id if self.frames else ""
+        for group_index, group in enumerate(self.layer_groups):
+            row = QWidget()
+            row.setObjectName("timelineGroupRow")
+            row.setMinimumHeight(92)
+            row.setMaximumHeight(136)
+            row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.group_timeline_row_hosts[group.group_id] = row
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(5)
+
+            visible_check = QCheckBox(group.name)
+            visible_check.setChecked(group.visible)
+            visible_check.setFixedWidth(150)
+            visible_check.setToolTip("勾选控制显示；点击名称切换到该动画组")
+            visible_check.clicked.connect(
+                lambda checked, group_id=group.group_id: self._timeline_group_visibility_changed(group_id, checked)
+            )
+            row_layout.addWidget(visible_check)
+            self.group_timeline_visibility_checks[group.group_id] = visible_check
+
+            timeline = self.timeline if group_index == 0 else TimelineListWidget()
+            if timeline is not self.timeline:
+                self._configure_group_timeline(timeline)
+                timeline.currentRowChanged.connect(
+                    lambda index, group_id=group.group_id, source=timeline: self._group_timeline_row_changed(
+                        group_id, source, index
+                    )
+                )
+                timeline.drag_started.connect(self._set_timeline_drag_active)
+                timeline.drag_finished.connect(self._clear_timeline_drag_active)
+                timeline.frame_move_requested.connect(self._timeline_frame_move_requested)
+            else:
+                self._primary_timeline_group_id = group.group_id
+            self.group_timeline_widgets[group.group_id] = timeline
+            timeline.blockSignals(True)
+            timeline.clear()
+            for frame_index, frame in enumerate(self.frames):
+                item = self._new_timeline_item_for_widget(timeline, frame, frame_index)
+                item.setIcon(QIcon(self._group_frame_thumbnail(group, frame.frame_id)))
+                timeline.addItem(item)
+                if frame.frame_id == selected_frame_id:
+                    timeline.setCurrentItem(item)
+            timeline.blockSignals(False)
+            row_layout.addWidget(timeline, 1)
+            self.timeline_rows_layout.addWidget(row, 1)
+        self._update_timeline_group_highlight()
+        self._focus_active_group_timeline()
+
+    def _new_timeline_item_for_widget(
+        self, timeline: TimelineListWidget, frame: FrameData, index: int
+    ) -> QListWidgetItem:
+        suffix = f" x{frame.exposure}" if frame.exposure > 1 else ""
+        item = QListWidgetItem(f"{index + 1}{suffix}")
+        item.setData(Qt.ItemDataRole.UserRole, frame.frame_id)
+        item.setSizeHint(timeline.gridSize())
+        item.setIcon(QIcon(self._thumbnail_placeholder()))
+        return item
+
+    def _timeline_group_visibility_changed(self, group_id: str, visible: bool) -> None:
+        group = next((candidate for candidate in self.layer_groups if candidate.group_id == group_id), None)
+        if group is None:
+            return
+        group.visible = visible
+        self._activate_layer_group(group_id)
+        self._rebuild_layer_group_list()
+        self.sync_drawing_layer_to_views()
+        self._mark_all_thumbnails_dirty()
+
+    def _group_timeline_row_changed(
+        self, group_id: str, timeline: TimelineListWidget, index: int
+    ) -> None:
+        if self._timeline_drag_active or index < 0:
+            return
+        item = timeline.item(index)
+        if item is None:
+            return
+        self._activate_layer_group(group_id, focus_timeline=False)
+        frame_id = str(item.data(Qt.ItemDataRole.UserRole))
+        if self._frame_for_id(frame_id) is not None:
+            self._pending_timeline_frame_id = frame_id
+            self._frame_switch_timer.start(16)
+
+    def _update_timeline_group_highlight(self) -> None:
+        for group_id, check in getattr(self, "group_timeline_visibility_checks", {}).items():
+            if group_id == self.active_layer_group_id:
+                check.setStyleSheet("QCheckBox { font-weight: 600; color: #2563eb; }")
+            else:
+                check.setStyleSheet("")
+        for group_id, row in getattr(self, "group_timeline_row_hosts", {}).items():
+            if group_id == self.active_layer_group_id:
+                row.setStyleSheet(
+                    "QWidget#timelineGroupRow { background: #e8f0fe; border: 2px solid #3b82f6; border-radius: 5px; }"
+                )
+            else:
+                row.setStyleSheet(
+                    "QWidget#timelineGroupRow { background: transparent; border: 2px solid transparent; }"
+                )
+        if hasattr(self, "timeline_ruler"):
+            self.timeline_ruler.set_timeline(self.group_timeline_widgets.get(self.active_layer_group_id))
+
+    def _focus_active_group_timeline(self) -> None:
+        if not hasattr(self, "timeline_rows_scroll"):
+            return
+        row = self.group_timeline_row_hosts.get(self.active_layer_group_id)
+        timeline = self.group_timeline_widgets.get(self.active_layer_group_id)
+        if row is not None:
+            self.timeline_rows_scroll.ensureWidgetVisible(row, 0, 10)
+        if timeline is not None and self.frames:
+            frame_id = self.frames[self.current_index].frame_id
+            item = next(
+                (
+                    timeline.item(index)
+                    for index in range(timeline.count())
+                    if str(timeline.item(index).data(Qt.ItemDataRole.UserRole)) == frame_id
+                ),
+                None,
+            )
+            if item is not None:
+                timeline.blockSignals(True)
+                try:
+                    timeline.setCurrentItem(item)
+                finally:
+                    timeline.blockSignals(False)
+                timeline.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
+
+    def _group_frame_thumbnail(self, group: LayerGroup, frame_id: str) -> QPixmap:
+        icon_size = self.timeline.iconSize()
+        thumbnail = QImage(icon_size, QImage.Format.Format_ARGB32_Premultiplied)
+        thumbnail.fill(Qt.GlobalColor.white if self.thumbnail_display_mode == "drawing" else Qt.GlobalColor.transparent)
+        reference = self._reference_image_for_thumbnail(frame_id)
+        target_rect = QRect(QPoint(), icon_size)
+        if not reference.isNull():
+            target_size = reference.size().scaled(icon_size, Qt.AspectRatioMode.KeepAspectRatio)
+            target_rect = QRect(
+                (icon_size.width() - target_size.width()) // 2,
+                (icon_size.height() - target_size.height()) // 2,
+                target_size.width(),
+                target_size.height(),
+            )
+        painter = QPainter(thumbnail)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self.thumbnail_display_mode in ("reference", "composite") and not reference.isNull():
+            painter.drawImage(target_rect, reference)
+        if self.thumbnail_display_mode != "reference":
+            drawing = self._drawing_for_group(group, frame_id)
+            if drawing is not None and not drawing.isNull():
+                painter.drawImage(target_rect, drawing)
+        painter.end()
+        return QPixmap.fromImage(thumbnail)
+
+    def _refresh_group_timeline_icons(self, frame_id: str | None = None) -> None:
+        for group in self.layer_groups:
+            timeline = self.group_timeline_widgets.get(group.group_id)
+            if timeline is None:
+                continue
+            for index in range(timeline.count()):
+                item = timeline.item(index)
+                item_frame_id = str(item.data(Qt.ItemDataRole.UserRole))
+                if frame_id is None or item_frame_id == frame_id:
+                    item.setIcon(QIcon(self._group_frame_thumbnail(group, item_frame_id)))
 
     def _create_timeline_panel(self) -> QWidget:
         panel = QWidget()
@@ -668,9 +1494,36 @@ class FrameViewerWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.addWidget(QLabel("缩略图显示"))
         controls.addWidget(self.thumbnail_display_combo)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("时间轴倍率"))
+        controls.addWidget(self.timeline_zoom_slider)
+        controls.addWidget(self.timeline_zoom_value_label)
         controls.addStretch(1)
         layout.addLayout(controls)
-        layout.addWidget(self.timeline)
+
+        ruler_row = QHBoxLayout()
+        ruler_row.setContentsMargins(0, 0, 0, 0)
+        ruler_row.setSpacing(5)
+        ruler_spacer = QWidget()
+        ruler_spacer.setFixedWidth(150)
+        ruler_row.addWidget(ruler_spacer)
+        self.timeline_ruler = TimelineRuler(self)
+        ruler_row.addWidget(self.timeline_ruler, 1)
+        layout.addLayout(ruler_row)
+
+        self.timeline_rows_widget = QWidget()
+        self.timeline_rows_layout = QVBoxLayout(self.timeline_rows_widget)
+        self.timeline_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.timeline_rows_layout.setSpacing(3)
+        self.timeline_rows_scroll = QScrollArea()
+        self.timeline_rows_scroll.setWidgetResizable(True)
+        self.timeline_rows_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.timeline_rows_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.timeline_rows_scroll.setMinimumHeight(96)
+        self.timeline_rows_scroll.setWidget(self.timeline_rows_widget)
+        layout.addWidget(self.timeline_rows_scroll)
+        self._rebuild_group_timeline_rows()
+        self.set_timeline_zoom()
         return panel
 
     def _create_top_toolbar(self) -> QToolBar:
@@ -699,7 +1552,6 @@ class FrameViewerWindow(QMainWindow):
         toolbar.addWidget(self.view_mode_combo)
         toolbar.addWidget(self.settings_button)
         toolbar.addSeparator()
-        toolbar.addWidget(self.frame_label)
         return toolbar
 
     def _create_compare_view(self) -> QWidget:
@@ -819,6 +1671,7 @@ class FrameViewerWindow(QMainWindow):
         onion_group = QGroupBox("洋葱皮")
         onion_layout = QVBoxLayout(onion_group)
         onion_layout.addWidget(self.onion_skin_checkbox)
+        onion_layout.addWidget(self.onion_loop_checkbox)
 
         previous_color_row = QHBoxLayout()
         previous_color_row.addWidget(QLabel("前一帧颜色"))
@@ -849,83 +1702,374 @@ class FrameViewerWindow(QMainWindow):
         combo.addItem("紫", "#a855f7")
         return combo
 
-    def _load_timeline(self) -> None:
-        self.timeline.clear()
-        self._thumbnail_cache.clear()
-        self._thumbnail_dirty = set(range(len(self.frame_paths)))
-        self._thumbnail_reference_cache.clear()
-        for index, path in enumerate(self.frame_paths):
-            item = QListWidgetItem(f"{index:04d}")
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            self.timeline.addItem(item)
+    def _load_timeline(self, selected_frame_id: str | None = None) -> None:
+        self._rebuilding_timeline = True
+        self._thumbnail_generation += 1
+        try:
+            self.timeline.clear()
+            for index, frame in enumerate(self.frames):
+                self.timeline.addItem(self._new_timeline_item(frame, index))
+        finally:
+            self._rebuilding_timeline = False
+        if selected_frame_id:
+            self._select_timeline_frame_id(selected_frame_id)
+        if hasattr(self, "timeline_rows_layout"):
+            self._rebuild_group_timeline_rows()
         self._schedule_visible_thumbnail_refresh()
+
+    def _sync_timeline_from_frames(self, selected_frame_id: str) -> bool:
+        """Reorder existing items without clearing icons or exposing an empty list."""
+        expected_ids = [frame.frame_id for frame in self.frames]
+        current_ids = [
+            str(self.timeline.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.timeline.count())
+        ]
+        if (
+            len(current_ids) != len(expected_ids)
+            or len(set(current_ids)) != len(current_ids)
+            or set(current_ids) != set(expected_ids)
+        ):
+            return False
+
+        self._rebuilding_timeline = True
+        self._thumbnail_generation += 1
+        self.timeline.blockSignals(True)
+        self.timeline.setUpdatesEnabled(False)
+        try:
+            for target_index, frame in enumerate(self.frames):
+                item = self._timeline_item_for_frame_id(frame.frame_id)
+                if item is None:
+                    return False
+                current_index = self.timeline.row(item)
+                if current_index != target_index:
+                    retained_item = self.timeline.takeItem(current_index)
+                    self.timeline.insertItem(target_index, retained_item)
+                suffix = f" x{frame.exposure}" if frame.exposure > 1 else ""
+                item.setText(f"{target_index + 1}{suffix}")
+                item.setSizeHint(self.timeline.gridSize())
+                if item.icon().isNull():
+                    item.setIcon(QIcon(self._thumbnail_placeholder()))
+            selected_item = self._timeline_item_for_frame_id(selected_frame_id)
+            if selected_item is not None:
+                self.timeline.setCurrentItem(selected_item)
+        finally:
+            self.timeline.setUpdatesEnabled(True)
+            self.timeline.blockSignals(False)
+            self._rebuilding_timeline = False
+            self.timeline.viewport().update()
+        self._schedule_visible_thumbnail_refresh()
+        self._sync_secondary_group_timelines(selected_frame_id)
+        return True
+
+    def _sync_secondary_group_timelines(self, selected_frame_id: str) -> None:
+        for timeline in self.group_timeline_widgets.values():
+            if timeline is self.timeline:
+                continue
+            timeline.blockSignals(True)
+            timeline.setUpdatesEnabled(False)
+            try:
+                items_by_id = {
+                    str(timeline.item(index).data(Qt.ItemDataRole.UserRole)): timeline.item(index)
+                    for index in range(timeline.count())
+                }
+                if set(items_by_id) != {frame.frame_id for frame in self.frames}:
+                    continue
+                for target_index, frame in enumerate(self.frames):
+                    item = items_by_id[frame.frame_id]
+                    current_index = timeline.row(item)
+                    if current_index != target_index:
+                        timeline.insertItem(target_index, timeline.takeItem(current_index))
+                    suffix = f" x{frame.exposure}" if frame.exposure > 1 else ""
+                    item.setText(f"{target_index + 1}{suffix}")
+                selected = items_by_id.get(selected_frame_id)
+                if selected is not None:
+                    timeline.setCurrentItem(selected)
+            finally:
+                timeline.setUpdatesEnabled(True)
+                timeline.blockSignals(False)
+
+    def _new_timeline_item(self, frame: FrameData, index: int) -> QListWidgetItem:
+        suffix = f" x{frame.exposure}" if frame.exposure > 1 else ""
+        item = QListWidgetItem(f"{index + 1}{suffix}")
+        item.setData(Qt.ItemDataRole.UserRole, frame.frame_id)
+        item.setSizeHint(self.timeline.gridSize())
+        item.setIcon(QIcon(self._thumbnail_placeholder()))
+        return item
+
+    def _thumbnail_placeholder(self) -> QPixmap:
+        icon_size = self.timeline.iconSize()
+        pixmap = QPixmap(icon_size)
+        pixmap.fill(Qt.GlobalColor.white)
+        painter = QPainter(pixmap)
+        painter.setPen(QPen(QColor("#9ca3af"), 1))
+        painter.drawRect(pixmap.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(QPen(QColor("#d1d5db"), 1))
+        painter.drawLine(0, 0, pixmap.width() - 1, pixmap.height() - 1)
+        painter.drawLine(0, pixmap.height() - 1, pixmap.width() - 1, 0)
+        painter.end()
+        return pixmap
+
+    def _frame_index_for_id(self, frame_id: str) -> int | None:
+        return next((index for index, frame in enumerate(self.frames) if frame.frame_id == frame_id), None)
+
+    def _frame_for_id(self, frame_id: str) -> FrameData | None:
+        index = self._frame_index_for_id(frame_id)
+        return self.frames[index] if index is not None else None
+
+    def _timeline_item_for_frame_id(self, frame_id: str) -> QListWidgetItem | None:
+        for index in range(self.timeline.count()):
+            item = self.timeline.item(index)
+            if str(item.data(Qt.ItemDataRole.UserRole)) == frame_id:
+                return item
+        return None
+
+    def _select_timeline_frame_id(self, frame_id: str) -> None:
+        for timeline in self.group_timeline_widgets.values() or [self.timeline]:
+            item = next(
+                (
+                    timeline.item(index)
+                    for index in range(timeline.count())
+                    if str(timeline.item(index).data(Qt.ItemDataRole.UserRole)) == frame_id
+                ),
+                None,
+            )
+            if item is None:
+                continue
+            timeline.blockSignals(True)
+            try:
+                timeline.setCurrentItem(item)
+            finally:
+                timeline.blockSignals(False)
+
+    def _timeline_row_changed(self, index: int) -> None:
+        if self._timeline_drag_active:
+            return
+        self._activate_layer_group(self._primary_timeline_group_id, focus_timeline=False)
+        item = self.timeline.item(index) if index >= 0 else None
+        frame_id = str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else ""
+        if self._frame_for_id(frame_id) is None:
+            return
+        self._pending_timeline_frame_id = frame_id
+        self._frame_switch_timer.start(16)
+
+    def _apply_pending_timeline_frame(self) -> None:
+        frame_id = self._pending_timeline_frame_id
+        self._pending_timeline_frame_id = None
+        index = self._frame_index_for_id(frame_id) if frame_id else None
+        if index is not None:
+            self.set_current_frame(index, update_timeline=True)
+
+    def _set_timeline_drag_active(self) -> None:
+        self._timeline_drag_active = True
+
+    def _clear_timeline_drag_active(self) -> None:
+        self._timeline_drag_active = False
+
+    def _timeline_frame_move_requested(self, source_id: str, anchor_id: str, place_after: bool) -> None:
+        if not getattr(self, "_rebuilding_timeline", False):
+            self._move_frame_by_id(source_id, anchor_id, place_after)
+
+    def _show_timeline_context_menu(self, position: QPoint) -> None:
+        item = self.timeline.itemAt(position)
+        index = self.timeline.row(item) if item is not None else self.current_index
+        if index < 0 or index >= len(self.frame_paths):
+            return
+        menu = QMenu(self.timeline)
+        exposure_menu = menu.addMenu("曝光拍数")
+        for exposure in (1, 2, 3, 4, 6, 8):
+            action = exposure_menu.addAction(f"{exposure} 拍")
+            action.setCheckable(True)
+            action.setChecked(self.frame_exposures[index] == exposure)
+            action.triggered.connect(lambda _checked=False, value=exposure: self.set_frame_exposure(index, value))
+        exposure_menu.addSeparator()
+        exposure_menu.addAction("自定义...", lambda: self._prompt_frame_exposure(index))
+        menu.exec(self.timeline.viewport().mapToGlobal(position))
+
+    def _prompt_frame_exposure(self, index: int) -> None:
+        value, accepted = QInputDialog.getInt(
+            self,
+            "曝光拍数",
+            "拍数",
+            self.frame_exposures[index],
+            1,
+            99,
+        )
+        if accepted:
+            self.set_frame_exposure(index, value)
+
+    def _frame_records(self) -> list[FrameData]:
+        return list(self.frames)
+
+    def _restore_frame_records(self, records: list[FrameData], current_index: int) -> None:
+        if not records or len({frame.frame_id for frame in records}) != len(records):
+            return
+        selected_frame_id = records[max(0, min(current_index, len(records) - 1))].frame_id
+        self.frames = list(records)
+        self._history_memory.reindex(self._histories_by_id())
+        self.current_index = max(0, min(current_index, len(records) - 1))
+        if not self._sync_timeline_from_frames(selected_frame_id):
+            self._load_timeline(selected_frame_id)
+        self.set_current_frame(self.current_index, update_timeline=True, ensure_visible=True)
+
+    def _reorder_frames(self, order: list[int], *, current_old_index: int | None = None) -> None:
+        if sorted(order) != list(range(len(self.frame_paths))):
+            return
+        records = self._frame_records()
+        old_current = self.current_index if current_old_index is None else current_old_index
+        self._restore_frame_records([records[index] for index in order], order.index(old_current))
+
+    def _move_frame_by_id(self, source_id: str, anchor_id: str = "", place_after: bool = True) -> bool:
+        """Atomically move one FrameData record using only stable frame ids."""
+        records_by_id = {frame.frame_id: frame for frame in self.frames}
+        if len(records_by_id) != len(self.frames) or source_id not in records_by_id:
+            return False
+        if anchor_id and anchor_id not in records_by_id:
+            return False
+        if source_id == anchor_id:
+            return False
+
+        records = list(self.frames)
+        source = records_by_id[source_id]
+        records.remove(source)
+        if anchor_id:
+            anchor_index = next(index for index, frame in enumerate(records) if frame.frame_id == anchor_id)
+            insert_at = anchor_index + (1 if place_after else 0)
+        else:
+            insert_at = len(records)
+        records.insert(insert_at, source)
+        if [frame.frame_id for frame in records] == [frame.frame_id for frame in self.frames]:
+            return False
+        self._restore_frame_records(records, insert_at)
+        return True
+
+    def set_frame_exposure(self, index: int, exposure: int) -> None:
+        if index < 0 or index >= len(self.frame_exposures):
+            return
+        self.frames[index].exposure = max(1, min(99, int(exposure)))
+        item = self.timeline.item(index)
+        if item is not None:
+            suffix = f" x{self.frames[index].exposure}" if self.frames[index].exposure > 1 else ""
+            item.setText(f"{index + 1}{suffix}")
+        if index == self.current_index:
+            self._playback_exposure_tick = 0
+            self.set_current_frame(index)
 
     def set_thumbnail_display_mode(self, *_args) -> None:
-        self.thumbnail_display_mode = self.thumbnail_display_combo.currentData()
-        self._settings.setValue("thumbnail_display_mode", self.thumbnail_display_mode)
-        self._schedule_visible_thumbnail_refresh()
+        self._pending_thumbnail_display_mode = self.thumbnail_display_combo.currentData()
+        self._apply_pending_thumbnail_display_mode()
 
-    def generate_frame_thumbnail(self, frame_index: int, display_mode: str | None = None) -> QPixmap:
+    def set_timeline_zoom(self, *_args) -> None:
+        if not hasattr(self, "timeline_zoom_slider"):
+            return
+        percent = int(self.timeline_zoom_slider.value())
+        self.timeline_zoom_value_label.setText(f"{percent}%")
+        scale = max(0.5, min(2.0, percent / 100.0))
+        icon_size = QSize(96, 54)
+        grid_size = QSize(max(54, round(108 * scale)), 82)
+        timelines = list(getattr(self, "group_timeline_widgets", {}).values()) or [self.timeline]
+        for timeline in timelines:
+            timeline.setIconSize(icon_size)
+            timeline.setGridSize(grid_size)
+            timeline.setMinimumHeight(88)
+            timeline.setMaximumHeight(132)
+            for index in range(timeline.count()):
+                timeline.item(index).setSizeHint(grid_size)
+        self._settings.setValue("timeline_zoom", percent)
+        for frame in self.frames:
+            frame.thumbnail_cache.clear()
+            frame.thumbnail_dirty = True
+        self._thumbnail_cache.clear()
+        self._thumbnail_dirty.update(frame.frame_id for frame in self.frames)
+        self._refresh_group_timeline_icons()
+        self._focus_active_group_timeline()
+        if hasattr(self, "timeline_ruler"):
+            self.timeline_ruler.update()
+        self._schedule_visible_thumbnail_refresh(delay_ms=32)
+
+
+    def _apply_pending_thumbnail_display_mode(self) -> None:
+        if self._pending_thumbnail_display_mode is None:
+            return
+        self.thumbnail_display_mode = self._pending_thumbnail_display_mode
+        self._pending_thumbnail_display_mode = None
+        self._thumbnail_generation += 1
+        self._settings.setValue("thumbnail_display_mode", self.thumbnail_display_mode)
+        visible_rect = self.timeline.viewport().rect()
+        for frame in self.frames:
+            item = self._timeline_item_for_frame_id(frame.frame_id)
+            if item is None or not self.timeline.visualItemRect(item).intersects(visible_rect):
+                continue
+            cached = frame.thumbnail_cache.get(self.thumbnail_display_mode)
+            item.setIcon(QIcon(cached) if cached is not None else QIcon(self._thumbnail_placeholder()))
+        self._refresh_group_timeline_icons()
+        self._schedule_visible_thumbnail_refresh(delay_ms=32)
+
+    def generate_frame_thumbnail(self, frame_id: str, display_mode: str | None = None) -> QPixmap:
         """Create one centered thumbnail without canvas-only helper overlays."""
+        start = perf_counter()
         mode = display_mode or self.thumbnail_display_mode
-        cache_key = (frame_index, mode)
-        cached = self._thumbnail_cache.get(cache_key)
-        if cached is not None and frame_index not in self._thumbnail_dirty:
+        frame = self._frame_for_id(frame_id)
+        if frame is None:
+            return self._thumbnail_placeholder()
+        cache_key = (frame.frame_id, mode)
+        cached = frame.thumbnail_cache.get(mode)
+        if cached is not None and not frame.thumbnail_dirty:
             return cached
 
-        reference = self._reference_image_for_thumbnail(frame_index)
+        reference = self._reference_image_for_thumbnail(frame.frame_id)
         if reference.isNull():
-            return QPixmap()
+            thumbnail = self._thumbnail_placeholder()
+            frame.thumbnail_cache[mode] = thumbnail
+            frame.thumbnail_dirty = False
+            self._thumbnail_cache[cache_key] = thumbnail
+            self._thumbnail_dirty.discard(frame.frame_id)
+            return thumbnail
 
-        if mode == "reference":
-            content = reference
-        else:
-            canvas_size = QSize(
-                reference.width() * self.practice_scale,
-                reference.height() * self.practice_scale,
-            )
-            content = QImage(canvas_size, QImage.Format.Format_ARGB32_Premultiplied)
-            content.fill(Qt.GlobalColor.white if mode == "drawing" else Qt.GlobalColor.transparent)
-
-            painter = QPainter(content)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            if mode == "composite":
-                painter.drawImage(content.rect(), reference)
-            drawing_layer = self._drawing_layer_for_thumbnail(frame_index, canvas_size)
-            if not drawing_layer.isNull():
-                painter.drawImage(0, 0, drawing_layer)
-            painter.end()
-
-        thumbnail = self._centered_thumbnail_pixmap(content)
+        icon_size = self.timeline.iconSize()
+        thumbnail_image = QImage(icon_size, QImage.Format.Format_ARGB32_Premultiplied)
+        thumbnail_image.fill(Qt.GlobalColor.white if mode == "drawing" else Qt.GlobalColor.transparent)
+        target_size = reference.size().scaled(icon_size, Qt.AspectRatioMode.KeepAspectRatio)
+        target_rect = QRect(
+            (icon_size.width() - target_size.width()) // 2,
+            (icon_size.height() - target_size.height()) // 2,
+            target_size.width(),
+            target_size.height(),
+        )
+        painter = QPainter(thumbnail_image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if mode in ("reference", "composite"):
+            painter.drawImage(target_rect, reference)
+        if mode != "reference":
+            drawing = self._composited_visible_drawing(frame.frame_id, target_rect.size())
+            if drawing is not None and not drawing.isNull():
+                painter.drawImage(target_rect, drawing)
+        painter.end()
+        thumbnail = QPixmap.fromImage(thumbnail_image)
+        frame.thumbnail_cache[mode] = thumbnail
+        frame.thumbnail_dirty = False
         self._thumbnail_cache[cache_key] = thumbnail
-        self._thumbnail_dirty.discard(frame_index)
+        self._thumbnail_dirty.discard(frame.frame_id)
+        elapsed_ms = (perf_counter() - start) * 1000
+        if elapsed_ms >= 16.0:
+            print(f"[thumbnail-generate] frame_id={frame.frame_id} mode={mode} total={elapsed_ms:.2f}ms")
         return thumbnail
 
-    def _reference_image_for_thumbnail(self, frame_index: int) -> QImage:
-        cached = self._thumbnail_reference_cache.get(frame_index)
-        if cached is not None:
-            return cached
-        if frame_index < 0 or frame_index >= len(self.frame_paths):
+    def _reference_image_for_thumbnail(self, frame_id: str) -> QImage:
+        frame = self._frame_for_id(frame_id)
+        if frame is None:
             return QImage()
-        project_image = self._project_reference_images.get(frame_index)
-        if project_image is not None:
-            image = project_image.copy()
+        if frame.thumbnail_reference is not None and not frame.thumbnail_reference.isNull():
+            return frame.thumbnail_reference
+        if frame.reference_image is not None:
+            image = frame.reference_image.copy()
         else:
-            image = QImage(str(self.frame_paths[frame_index])).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-        self._thumbnail_reference_cache[frame_index] = image
+            image = QImage(str(frame.path)).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        frame.thumbnail_reference = image
         return image
 
-    def _drawing_layer_for_thumbnail(self, frame_index: int, canvas_size: QSize) -> QImage:
-        drawing_layer = self.drawing_layers.get(frame_index)
-        if drawing_layer is None or drawing_layer.isNull():
-            return QImage()
-        if drawing_layer.size() == canvas_size:
-            return drawing_layer
-        return drawing_layer.scaled(
-            canvas_size,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+    def _drawing_layer_for_thumbnail(self, frame_id: str, canvas_size: QSize) -> QImage:
+        drawing = self._composited_visible_drawing(frame_id, canvas_size)
+        return drawing if drawing is not None else QImage()
 
     def _centered_thumbnail_pixmap(self, image: QImage) -> QPixmap:
         icon_size = self.timeline.iconSize()
@@ -945,19 +2089,28 @@ class FrameViewerWindow(QMainWindow):
         painter.end()
         return pixmap
 
-    def _mark_frame_thumbnail_dirty(self, frame_index: int) -> None:
-        self._thumbnail_dirty.add(frame_index)
+    def _mark_frame_thumbnail_dirty(self, frame_id: str) -> None:
+        frame = self._frame_for_id(frame_id)
+        if frame is None:
+            return
+        frame.thumbnail_dirty = True
+        self._thumbnail_dirty.add(frame.frame_id)
         for mode in ("reference", "drawing", "composite"):
-            self._thumbnail_cache.pop((frame_index, mode), None)
+            frame.thumbnail_cache.pop(mode, None)
+            self._thumbnail_cache.pop((frame.frame_id, mode), None)
+        self._refresh_group_timeline_icons(frame_id)
         self._schedule_visible_thumbnail_refresh(delay_ms=160)
 
     def _mark_all_thumbnails_dirty(self) -> None:
-        self._thumbnail_dirty.update(range(len(self.frame_paths)))
+        for frame in self.frames:
+            frame.thumbnail_dirty = True
+            frame.thumbnail_cache.clear()
+        self._thumbnail_dirty.update(frame.frame_id for frame in self.frames)
         self._thumbnail_cache.clear()
         self._schedule_visible_thumbnail_refresh()
 
     def _schedule_visible_thumbnail_refresh(self, *_args, delay_ms: int = 0) -> None:
-        delay_ms = max(0, delay_ms)
+        delay_ms = max(16, delay_ms)
         if self._thumbnail_refresh_timer.isActive():
             if delay_ms > 0:
                 self._thumbnail_refresh_timer.start(delay_ms)
@@ -965,34 +2118,56 @@ class FrameViewerWindow(QMainWindow):
         self._thumbnail_refresh_timer.start(delay_ms)
 
     def _refresh_visible_thumbnails(self) -> None:
+        idle_ms = (perf_counter() - self._last_frame_switch_at) * 1000
+        if idle_ms < 120:
+            self._schedule_visible_thumbnail_refresh(delay_ms=max(16, int(120 - idle_ms)))
+            return
         refresh_start = perf_counter()
         refreshed = 0
         visible_rect = self.timeline.viewport().rect()
+        pending_frame_ids: list[str] = []
         for index in range(self.timeline.count()):
             item = self.timeline.item(index)
-            if self.timeline.visualItemRect(item).intersects(visible_rect):
-                self._update_timeline_item_thumbnail(index)
-                refreshed += 1
+            frame_id = str(item.data(Qt.ItemDataRole.UserRole))
+            frame = self._frame_for_id(frame_id)
+            if frame is None:
+                continue
+            cache_key = (frame.frame_id, self.thumbnail_display_mode)
+            if (
+                self.timeline.visualItemRect(item).intersects(visible_rect)
+                and (frame.thumbnail_dirty or cache_key not in self._thumbnail_cache)
+            ):
+                pending_frame_ids.append(frame_id)
+        generation = self._thumbnail_generation
+        for frame_id in pending_frame_ids[:2]:
+            if generation != self._thumbnail_generation:
+                return
+            self._update_timeline_item_thumbnail(frame_id, generation)
+            refreshed += 1
+        if len(pending_frame_ids) > refreshed:
+            self._schedule_visible_thumbnail_refresh(delay_ms=16)
         total_ms = (perf_counter() - refresh_start) * 1000
         if total_ms >= 16.0:
             print(f"[thumbnail-refresh] visible_items={refreshed} total={total_ms:.2f}ms")
 
-    def _refresh_frame_thumbnail_if_visible(self, frame_index: int) -> None:
-        if frame_index < 0 or frame_index >= self.timeline.count():
+    def _refresh_frame_thumbnail_if_visible(self, frame_id: str) -> None:
+        item = self._timeline_item_for_frame_id(frame_id)
+        if item is None:
             return
-        item = self.timeline.item(frame_index)
         if self.timeline.visualItemRect(item).intersects(self.timeline.viewport().rect()):
-            self._update_timeline_item_thumbnail(frame_index)
+            self._update_timeline_item_thumbnail(frame_id, self._thumbnail_generation)
 
-    def _update_timeline_item_thumbnail(self, frame_index: int) -> None:
-        if frame_index < 0 or frame_index >= self.timeline.count():
+    def _update_timeline_item_thumbnail(self, frame_id: str, generation: int) -> None:
+        if generation != self._thumbnail_generation:
             return
-        self.timeline.item(frame_index).setIcon(
-            QIcon(self.generate_frame_thumbnail(frame_index, self.thumbnail_display_mode))
-        )
+        item = self._timeline_item_for_frame_id(frame_id)
+        if item is None or str(item.data(Qt.ItemDataRole.UserRole)) != frame_id:
+            return
+        item.setIcon(QIcon(self.generate_frame_thumbnail(frame_id, self.thumbnail_display_mode)))
 
     def eventFilter(self, watched, event):  # type: ignore[override]
-        if watched is self.timeline.viewport() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+        timeline = getattr(self, "timeline", None)
+        if timeline is not None and watched is timeline.viewport() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
             self._schedule_visible_thumbnail_refresh()
 
         if (
@@ -1052,17 +2227,24 @@ class FrameViewerWindow(QMainWindow):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = APP_DIR / "work" / "imported_gif_frames" / f"{self.current_gif_path.stem}_step{step}_{timestamp}"
         try:
-            self.frame_paths = export_png_sequence(frames, output_dir)
+            imported_paths = export_png_sequence(frames, output_dir)
         except Exception as exc:
             QMessageBox.critical(self, "导入失败", f"导出 PNG 序列失败：\n{exc}")
             return
 
-        self.frame_durations = [frame.duration if frame.duration > 0 else 120 for frame in frames]
+        self.frames = [
+            FrameData(
+                frame_id=uuid4().hex,
+                path=path,
+                duration=frame.duration if frame.duration > 0 else 120,
+            )
+            for path, frame in zip(imported_paths, frames)
+        ]
+        self.playback_range_start = 0
+        self.playback_range_end = max(0, len(self.frames) - 1)
+        self._reset_layer_groups()
         self.current_index = 0
         self.current_project_path = None
-        self._project_reference_images.clear()
-        self.drawing_layers.clear()
-        self.frame_histories.clear()
         self._history_memory.reset()
         self._pending_stroke_before.clear()
 
@@ -1097,22 +2279,29 @@ class FrameViewerWindow(QMainWindow):
 
     def _write_project(self, project_path: Path) -> bool:
         try:
+            self._store_active_layer_group()
             project_path.parent.mkdir(parents=True, exist_ok=True)
             manifest: dict[str, object] = {
-                "version": 1,
+                "version": 4,
                 "frame_durations": self.frame_durations,
+                "frame_exposures": self.frame_exposures,
+                "frame_ids": [frame.frame_id for frame in self.frames],
                 "practice_scale": self.practice_scale,
                 "current_index": self.current_index,
+                "playback_range": [self.playback_range_start, self.playback_range_end],
+                "onion_loop": self.onion_loop_checkbox.isChecked(),
                 "reference_frames": [],
                 "drawing_layers": {},
+                "active_layer_group_id": self.active_layer_group_id,
+                "layer_groups": [],
             }
             with zipfile.ZipFile(project_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 reference_entries: list[str] = []
                 drawing_entries: dict[str, str] = {}
-                for index, path in enumerate(self.frame_paths):
-                    reference = self._reference_image_for_thumbnail(index)
+                for index, frame in enumerate(self.frames):
+                    reference = self._reference_image_for_thumbnail(frame.frame_id)
                     if reference.isNull():
-                        raise ValueError(f"无法读取参考帧：{path}")
+                        raise ValueError(f"Unable to read reference frame: {frame.path}")
                     reference_entry = f"reference/frame_{index:04d}.png"
                     archive.writestr(reference_entry, self._qimage_to_png_bytes(reference))
                     reference_entries.append(reference_entry)
@@ -1124,6 +2313,23 @@ class FrameViewerWindow(QMainWindow):
                         drawing_entries[str(index)] = drawing_entry
                 manifest["reference_frames"] = reference_entries
                 manifest["drawing_layers"] = drawing_entries
+                group_entries: list[dict[str, object]] = []
+                for group_index, group in enumerate(self.layer_groups):
+                    entries: dict[str, str] = {}
+                    for frame_index, frame in enumerate(self.frames):
+                        drawing = group.drawings.get(frame.frame_id)
+                        if drawing is None or drawing.isNull():
+                            continue
+                        entry = f"layers/group_{group_index:04d}/frame_{frame_index:04d}.png"
+                        archive.writestr(entry, self._qimage_to_png_bytes(drawing))
+                        entries[str(frame_index)] = entry
+                    group_entries.append({
+                        "id": group.group_id,
+                        "name": group.name,
+                        "visible": group.visible,
+                        "drawings": entries,
+                    })
+                manifest["layer_groups"] = group_entries
                 archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         except Exception as exc:
             QMessageBox.critical(self, "保存工程失败", str(exc))
@@ -1143,7 +2349,7 @@ class FrameViewerWindow(QMainWindow):
         try:
             with zipfile.ZipFile(project_path, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-                if manifest.get("version") != 1:
+                if manifest.get("version") not in (1, 2, 3, 4):
                     raise ValueError("不支持的工程版本。")
                 reference_entries = manifest.get("reference_frames")
                 if not isinstance(reference_entries, list) or not reference_entries:
@@ -1171,13 +2377,47 @@ class FrameViewerWindow(QMainWindow):
                         if image.loadFromData(archive.read(entry), "PNG") and not image.isNull():
                             drawing_layers[index] = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
 
+                restored_groups: list[tuple[str, str, bool, dict[int, QImage]]] = []
+                raw_groups = manifest.get("layer_groups", [])
+                if isinstance(raw_groups, list):
+                    for group_index, raw_group in enumerate(raw_groups):
+                        if not isinstance(raw_group, dict):
+                            continue
+                        restored_drawings: dict[int, QImage] = {}
+                        raw_entries = raw_group.get("drawings", {})
+                        if isinstance(raw_entries, dict):
+                            for raw_index, entry in raw_entries.items():
+                                index = int(raw_index)
+                                if index < 0 or index >= len(restored_paths) or not isinstance(entry, str) or not entry.startswith("layers/"):
+                                    continue
+                                image = QImage()
+                                if image.loadFromData(archive.read(entry), "PNG") and not image.isNull():
+                                    restored_drawings[index] = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+                        restored_groups.append((
+                            str(raw_group.get("id") or uuid4().hex),
+                            str(raw_group.get("name") or f"图层组 {group_index + 1}"),
+                            bool(raw_group.get("visible", True)),
+                            restored_drawings,
+                        ))
+
                 raw_durations = manifest.get("frame_durations", [])
                 durations = [max(1, int(value)) for value in raw_durations] if isinstance(raw_durations, list) else []
                 if len(durations) != len(restored_paths):
                     durations = [120 for _ in restored_paths]
+                raw_exposures = manifest.get("frame_exposures", [])
+                exposures = [max(1, min(99, int(value))) for value in raw_exposures] if isinstance(raw_exposures, list) else []
+                if len(exposures) != len(restored_paths):
+                    exposures = [1 for _ in restored_paths]
                 saved_scale = int(manifest.get("practice_scale", 3))
                 saved_scale = saved_scale if saved_scale in (1, 2, 3, 4) else 3
                 saved_index = max(0, min(int(manifest.get("current_index", 0)), len(restored_paths) - 1))
+                raw_playback_range = manifest.get("playback_range", [0, len(restored_paths) - 1])
+                if isinstance(raw_playback_range, list) and len(raw_playback_range) == 2:
+                    saved_range_start = max(0, min(int(raw_playback_range[0]), len(restored_paths) - 1))
+                    saved_range_end = max(saved_range_start, min(int(raw_playback_range[1]), len(restored_paths) - 1))
+                else:
+                    saved_range_start, saved_range_end = 0, len(restored_paths) - 1
+                saved_onion_loop = bool(manifest.get("onion_loop", False))
         except Exception as exc:
             QMessageBox.critical(self, "打开工程失败", str(exc))
             return
@@ -1188,18 +2428,51 @@ class FrameViewerWindow(QMainWindow):
         self.current_gif_path = None
         self.current_project_path = project_path
         self.import_step_slider.setEnabled(False)
-        self.frame_paths = restored_paths
-        self._project_reference_images = restored_references
-        self.frame_durations = durations
-        self.drawing_layers = drawing_layers
-        self.frame_histories.clear()
+        saved_ids = manifest.get("frame_ids", [])
+        self.frames = [
+            FrameData(
+                frame_id=str(saved_ids[index]) if isinstance(saved_ids, list) and index < len(saved_ids) else uuid4().hex,
+                path=path,
+                duration=durations[index],
+                exposure=exposures[index],
+                reference_image=restored_references.get(index),
+                drawing=drawing_layers.get(index),
+            )
+            for index, path in enumerate(restored_paths)
+        ]
+        if restored_groups:
+            self.layer_groups = [
+                LayerGroup(
+                    group_id,
+                    name,
+                    visible,
+                    {self.frames[index].frame_id: image for index, image in drawings.items()},
+                )
+                for group_id, name, visible, drawings in restored_groups
+            ]
+            requested_active = str(manifest.get("active_layer_group_id", ""))
+            active = next((group for group in self.layer_groups if group.group_id == requested_active), self.layer_groups[0])
+            self.active_layer_group_id = active.group_id
+            for frame in self.frames:
+                frame.drawing = active.drawings.get(frame.frame_id)
+        else:
+            self.layer_groups = [LayerGroup(uuid4().hex, "图层组 1")]
+            self.active_layer_group_id = self.layer_groups[0].group_id
+            self._store_active_layer_group()
         self._history_memory.reset()
         self._pending_stroke_before.clear()
+        self._drawing_operation_context.clear()
+        self.playback_range_start = saved_range_start
+        self.playback_range_end = saved_range_end
         self.current_index = saved_index
         self.practice_scale_combo.blockSignals(True)
         self.practice_scale_combo.setCurrentIndex(self.practice_scale_combo.findData(saved_scale))
         self.practice_scale_combo.blockSignals(False)
         self.practice_scale = saved_scale
+        self.onion_loop_checkbox.blockSignals(True)
+        self.onion_loop_checkbox.setChecked(saved_onion_loop)
+        self.onion_loop_checkbox.blockSignals(False)
+        self._rebuild_layer_group_list()
         self._load_timeline()
         self.set_current_frame(saved_index, update_timeline=True)
 
@@ -1225,7 +2498,8 @@ class FrameViewerWindow(QMainWindow):
             pil_frames = []
             for index in range(len(self.frame_paths)):
                 image = self._drawing_canvas_export_frame(index)
-                pil_frames.append(Image.open(io.BytesIO(self._qimage_to_png_bytes(image))).convert("RGB"))
+                frame = Image.open(io.BytesIO(self._qimage_to_png_bytes(image))).convert("RGB")
+                pil_frames.extend(frame.copy() for _ in range(self.frame_exposures[index]))
             if not pil_frames:
                 raise ValueError("没有可导出的帧。")
             duration = max(1, round(1000 / self.export_fps_slider.value()))
@@ -1254,14 +2528,15 @@ class FrameViewerWindow(QMainWindow):
         return bytes(data)
 
     def _drawing_canvas_export_frame(self, frame_index: int) -> QImage:
-        reference = self._reference_image_for_thumbnail(frame_index)
+        frame_id = self.frames[frame_index].frame_id
+        reference = self._reference_image_for_thumbnail(frame_id)
         if reference.isNull():
             raise ValueError(f"无法读取第 {frame_index + 1} 帧参考图。")
         canvas_size = QSize(reference.width() * self.practice_scale, reference.height() * self.practice_scale)
         canvas = QImage(canvas_size, QImage.Format.Format_RGB32)
         canvas.fill(Qt.GlobalColor.white)
         painter = QPainter(canvas)
-        drawing = self._drawing_layer_for_thumbnail(frame_index, canvas_size)
+        drawing = self._drawing_layer_for_thumbnail(frame_id, canvas_size)
         if not drawing.isNull():
             painter.drawImage(0, 0, drawing)
         painter.end()
@@ -1278,52 +2553,88 @@ class FrameViewerWindow(QMainWindow):
         if index < 0 or index >= len(self.frame_paths):
             return False
 
+        switch_start = perf_counter()
+        self._last_frame_switch_at = switch_start
         self.current_index = index
-        previous_pixmap = self._load_frame_pixmap(index - 1)
-        current_pixmap = self._load_frame_pixmap(index)
-        next_pixmap = self._load_frame_pixmap(index + 1)
+        if hasattr(self, "timeline_ruler"):
+            self.timeline_ruler.update()
+        onion_active = self.onion_skin_checkbox.isChecked() and not self.play_timer.isActive()
+        previous_index = self._onion_neighbor_index(index, -1) if onion_active else None
+        next_index = self._onion_neighbor_index(index, 1) if onion_active else None
+        previous_pixmap = self._load_frame_pixmap(self.frames[previous_index].frame_id) if previous_index is not None else None
+        current_pixmap = self._load_frame_pixmap(self.frames[index].frame_id)
+        next_pixmap = self._load_frame_pixmap(self.frames[next_index].frame_id) if next_index is not None else None
+        image_read_ms = (perf_counter() - switch_start) * 1000
 
         if current_pixmap is None or current_pixmap.isNull():
             return False
 
         self._update_practice_canvas_size(current_pixmap)
 
-        self.overlay_canvas.set_content_scale(self.practice_scale)
-        self.compare_reference_canvas.set_content_scale(self.practice_scale)
-        self.reference_only_canvas.set_content_scale(self._reference_only_scale())
-        self.reference_float_canvas.set_content_scale(self.practice_scale)
+        for canvas, scale in (
+            (self.overlay_canvas, self.practice_scale),
+            (self.compare_reference_canvas, self.practice_scale),
+            (self.reference_only_canvas, self._reference_only_scale()),
+            (self.reference_float_canvas, self.practice_scale),
+        ):
+            if canvas.isVisible():
+                canvas.set_content_scale(scale)
 
         for canvas in self.reference_canvases:
+            if not canvas.isVisible():
+                continue
             canvas.set_frame_layers(previous_pixmap, current_pixmap, next_pixmap)
+        reference_update_ms = (perf_counter() - switch_start) * 1000 - image_read_ms
 
-        self.sync_drawing_layer_to_views()
+        drawing_start = perf_counter()
+        self.sync_drawing_layer_to_views(visible_only=True)
         self._refresh_onion_skin_visibility()
+        drawing_onion_update_ms = (perf_counter() - drawing_start) * 1000
 
-        if update_timeline and self.timeline.currentRow() != index:
-            self.timeline.blockSignals(True)
-            try:
-                self.timeline.setCurrentRow(index)
-            finally:
-                self.timeline.blockSignals(False)
+        frame_id = self.frames[index].frame_id
+        if update_timeline:
+            self._select_timeline_frame_id(frame_id)
 
-        if ensure_visible and 0 <= index < self.timeline.count():
-            self.timeline.scrollToItem(
-                self.timeline.item(index),
-                QAbstractItemView.ScrollHint.EnsureVisible,
-            )
+        if ensure_visible:
+            item = self._timeline_item_for_frame_id(frame_id)
+            if item is not None:
+                self.timeline.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
 
         self.frame_label.setText(f"帧 {index + 1} / {len(self.frame_paths)}")
         self._restart_playback_timer_if_active()
+        self._frame_preload_timer.start(48)
+        total_ms = (perf_counter() - switch_start) * 1000
+        if total_ms >= 16.0:
+            print(
+                "[frame-switch] "
+                f"index={index} image_read={image_read_ms:.2f}ms "
+                f"reference_update={reference_update_ms:.2f}ms "
+                f"drawing_onion_update={drawing_onion_update_ms:.2f}ms total={total_ms:.2f}ms"
+            )
         return True
 
     def set_view_mode(self, index: int) -> None:
+        start = perf_counter()
         self.view_stack.setCurrentIndex(index)
-        if self.frame_paths and self.current_drawing_size.width() > 1 and self.current_drawing_size.height() > 1:
-            self.sync_drawing_layer_to_views()
         if self.view_stack.currentWidget() is self.float_reference_view:
             self.reference_float_window.show()
             self.reference_float_window.raise_()
             self.reference_float_window.canvas.fit_to_view()
+        if self.frame_paths:
+            self.refresh_current_frame()
+        total_ms = (perf_counter() - start) * 1000
+        if total_ms >= 16.0:
+            print(f"[view-switch] mode={index} total={total_ms:.2f}ms")
+
+    def request_view_mode(self, index: int) -> None:
+        self._pending_view_mode = index
+        self._view_switch_timer.start(16)
+
+    def _apply_pending_view_mode(self) -> None:
+        index = self._pending_view_mode
+        self._pending_view_mode = None
+        if index is not None:
+            self.set_view_mode(index)
 
     def set_practice_scale(self, *_args) -> None:
         self.practice_scale = self.practice_scale_combo.currentData()
@@ -1503,10 +2814,29 @@ class FrameViewerWindow(QMainWindow):
             return
         source = self.sender()
         kind = str(getattr(source, "_drawing_tool", "stroke"))
-        self._pending_stroke_before[self.current_index] = (kind, image.copy())
+        frame_id = self.frames[self.current_index].frame_id
+        self._pending_stroke_before[frame_id] = (kind, image.copy())
+        if source is not None:
+            self._drawing_operation_context[source] = (self.active_layer_group_id, frame_id)
+
+    def _drawing_commit_matches_active_context(self) -> bool:
+        source = self.sender()
+        if source is None:
+            return True
+        context = self._drawing_operation_context.pop(source, None)
+        if context is None:
+            return True
+        current = (self.active_layer_group_id, self.frames[self.current_index].frame_id)
+        if context == current and self._active_layer_group().visible:
+            return True
+        self._pending_stroke_before.pop(context[1], None)
+        self.sync_drawing_layer_to_views()
+        return False
 
     def update_current_drawing_layer(self, *args) -> None:
         if self._syncing_drawing:
+            return
+        if not self._drawing_commit_matches_active_context():
             return
         if len(args) == 4:
             kind, rect, before_patch, after_patch = args
@@ -1520,14 +2850,14 @@ class FrameViewerWindow(QMainWindow):
         if len(args) != 1:
             return
         image = args[0]
-        pending = self._pending_stroke_before.pop(self.current_index, None)
+        pending = self._pending_stroke_before.pop(self.frames[self.current_index].frame_id, None)
         after = image.copy()
         self.drawing_layers[self.current_index] = after
         if pending is not None:
             kind, before = pending
             self._commit_drawing_operation_from_images(kind, before, after)
         self.sync_drawing_layer_to_views()
-        self._mark_frame_thumbnail_dirty(self.current_index)
+        self._mark_frame_thumbnail_dirty(self.frames[self.current_index].frame_id)
 
     def _update_current_drawing_layer_patch(
         self,
@@ -1537,7 +2867,7 @@ class FrameViewerWindow(QMainWindow):
         after_patch: QImage,
     ) -> None:
         total_start = perf_counter()
-        self._pending_stroke_before.pop(self.current_index, None)
+        self._pending_stroke_before.pop(self.frames[self.current_index].frame_id, None)
         image = self._drawing_image_for_current_frame()
         target_rect = rect.intersected(image.rect())
         if target_rect.isEmpty():
@@ -1564,7 +2894,7 @@ class FrameViewerWindow(QMainWindow):
         refresh_ms = (perf_counter() - refresh_start) * 1000
 
         thumb_start = perf_counter()
-        self._mark_frame_thumbnail_dirty(self.current_index)
+        self._mark_frame_thumbnail_dirty(self.frames[self.current_index].frame_id)
         thumbnail_ms = (perf_counter() - thumb_start) * 1000
         total_ms = (perf_counter() - total_start) * 1000
         if total_ms >= 8.0:
@@ -1580,10 +2910,10 @@ class FrameViewerWindow(QMainWindow):
         current_image = self._drawing_image_for_current_frame().copy()
         blank = self._new_blank_drawing_image(self.current_drawing_size)
         self.drawing_layers[self.current_index] = blank
-        self._pending_stroke_before.pop(self.current_index, None)
+        self._pending_stroke_before.pop(self.frames[self.current_index].frame_id, None)
         self._commit_drawing_operation_from_images("clear", current_image, blank)
         self.sync_drawing_layer_to_views()
-        self._mark_frame_thumbnail_dirty(self.current_index)
+        self._mark_frame_thumbnail_dirty(self.frames[self.current_index].frame_id)
 
     def undo_current_frame_drawing(self) -> None:
         history = self.frame_histories.get(self.current_index)
@@ -1592,9 +2922,9 @@ class FrameViewerWindow(QMainWindow):
         operation = history.undo.pop()
         self._apply_drawing_operation_patch(operation, operation.before_patch)
         history.redo.append(operation)
-        self._pending_stroke_before.pop(self.current_index, None)
+        self._pending_stroke_before.pop(self.frames[self.current_index].frame_id, None)
         self._sync_drawing_patch_to_visible_views(operation.rect, operation.before_patch)
-        self._mark_frame_thumbnail_dirty(self.current_index)
+        self._mark_frame_thumbnail_dirty(self.frames[self.current_index].frame_id)
 
     def redo_current_frame_drawing(self) -> None:
         history = self.frame_histories.get(self.current_index)
@@ -1603,18 +2933,29 @@ class FrameViewerWindow(QMainWindow):
         operation = history.redo.pop()
         self._apply_drawing_operation_patch(operation, operation.after_patch)
         history.undo.append(operation)
-        self._pending_stroke_before.pop(self.current_index, None)
+        self._pending_stroke_before.pop(self.frames[self.current_index].frame_id, None)
         self._sync_drawing_patch_to_visible_views(operation.rect, operation.after_patch)
-        self._mark_frame_thumbnail_dirty(self.current_index)
+        self._mark_frame_thumbnail_dirty(self.frames[self.current_index].frame_id)
 
     def _commit_drawing_operation(self, operation: DrawingOperation) -> None:
-        history = self.frame_histories.setdefault(self.current_index, FrameDrawingHistory())
+        frame = self.frames[self.current_index]
+        history = frame.history
+        if history is None:
+            history = FrameDrawingHistory()
+            frame.history = history
         self._history_memory.commit(
-            self.current_index,
+            frame.frame_id,
             history,
             operation,
-            self.frame_histories,
+            self._histories_by_id(),
         )
+
+    def _histories_by_id(self) -> dict[str, FrameDrawingHistory]:
+        return {
+            frame.frame_id: frame.history
+            for frame in self.frames
+            if frame.history is not None
+        }
 
     def _commit_drawing_operation_from_images(self, kind: str, before: QImage, after: QImage) -> None:
         operation = self._drawing_operation_from_images(kind, before, after)
@@ -1702,21 +3043,90 @@ class FrameViewerWindow(QMainWindow):
         finally:
             self._syncing_drawing = False
 
-    def sync_drawing_layer_to_views(self) -> None:
+    def sync_drawing_layer_to_views(self, *, visible_only: bool = False) -> None:
         image = self._drawing_image_for_current_frame()
+        active_group = self._active_layer_group()
+        active_index = self.layer_groups.index(active_group)
+        # The list is front-to-back: rows above the active group render above it.
+        above = self._composite_group_range(self.layer_groups[:active_index], self.frames[self.current_index].frame_id)
+        below = self._composite_group_range(self.layer_groups[active_index + 1 :], self.frames[self.current_index].frame_id)
         self._syncing_drawing = True
         try:
             for canvas in self.drawing_canvases:
+                if visible_only and not canvas.isVisible():
+                    continue
                 canvas.set_drawing_image(image)
+                canvas.set_drawing_group_images(below, above)
+                canvas.set_drawing_layer_visible(active_group.visible)
+                canvas.set_drawing_enabled(active_group.visible)
         finally:
             self._syncing_drawing = False
         self._refresh_drawing_onion_layers()
+
+    def _drawing_for_group(self, group: LayerGroup, frame_id: str) -> QImage | None:
+        if group.group_id == self.active_layer_group_id:
+            frame = self._frame_for_id(frame_id)
+            return frame.drawing if frame is not None else None
+        return group.drawings.get(frame_id)
+
+    def _composite_group_range(self, groups: list[LayerGroup], frame_id: str) -> QImage | None:
+        visible = [group for group in groups if group.visible]
+        if not visible:
+            return None
+        result = self._new_blank_drawing_image(self.current_drawing_size)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        for group in reversed(visible):
+            image = self._drawing_for_group(group, frame_id)
+            if image is None or image.isNull():
+                continue
+            if image.size() != result.size():
+                image = image.scaled(result.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            painter.drawImage(0, 0, image)
+        painter.end()
+        return result
+
+    def _composited_visible_drawing(self, frame_id: str, size: QSize | None = None) -> QImage | None:
+        target_size = QSize(size) if size is not None else QSize(self.current_drawing_size)
+        if target_size.isEmpty():
+            return None
+        result = self._new_blank_drawing_image(target_size)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        drew_content = False
+        for group in reversed(self.layer_groups):
+            if not group.visible:
+                continue
+            image = self._drawing_for_group(group, frame_id)
+            if image is None or image.isNull():
+                continue
+            if image.size() != target_size:
+                image = image.scaled(target_size, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            painter.drawImage(0, 0, image)
+            drew_content = True
+        painter.end()
+        return result if drew_content else None
 
     def export_current_drawing_png(self, path: str | Path) -> bool:
         return self._drawing_image_for_current_frame().save(str(path), "PNG")
 
     def set_onion_skin_enabled(self, enabled: bool) -> None:
+        self._refresh_drawing_onion_layers()
         self._refresh_onion_skin_visibility()
+
+    def set_onion_loop_enabled(self, enabled: bool) -> None:
+        self.refresh_current_frame()
+
+    def _onion_neighbor_index(self, index: int, offset: int) -> int | None:
+        count = len(self.frame_paths)
+        if count <= 1:
+            return None
+        candidate = index + offset
+        if 0 <= candidate < count:
+            return candidate
+        if self.onion_loop_checkbox.isChecked():
+            return candidate % count
+        return None
 
     def set_onion_skin_opacity(self, value: int) -> None:
         for canvas in self.reference_canvases:
@@ -1749,16 +3159,26 @@ class FrameViewerWindow(QMainWindow):
             self._refresh_onion_skin_visibility()
             return
 
-        previous = self._drawing_onion_image_for_frame(self.current_index - 1)
-        next_image = self._drawing_onion_image_for_frame(self.current_index + 1)
+        previous = None
+        next_image = None
+        if self.onion_skin_checkbox.isChecked():
+            previous_index = self._onion_neighbor_index(self.current_index, -1)
+            next_index = self._onion_neighbor_index(self.current_index, 1)
+            previous = self._drawing_onion_image_for_frame(previous_index) if previous_index is not None else None
+            next_image = self._drawing_onion_image_for_frame(next_index) if next_index is not None else None
         for canvas in self.drawing_canvases:
+            if not canvas.isVisible():
+                continue
             canvas.set_drawing_onion_layers(previous, next_image)
         self._refresh_onion_skin_visibility()
 
     def _drawing_onion_image_for_frame(self, frame_index: int) -> QImage | None:
         if frame_index < 0 or frame_index >= len(self.frame_paths):
             return None
-        image = self.drawing_layers.get(frame_index)
+        group = self._active_layer_group()
+        if not group.visible:
+            return None
+        image = self._drawing_for_group(group, self.frames[frame_index].frame_id)
         if image is None or image.isNull():
             return None
         if image.size() == self.current_drawing_size:
@@ -1773,9 +3193,9 @@ class FrameViewerWindow(QMainWindow):
         width = reference_pixmap.width() * self.practice_scale
         height = reference_pixmap.height() * self.practice_scale
         self.current_drawing_size = QSize(width, height)
-        self.compare_trace_canvas.set_canvas_size(width, height, self.practice_scale)
-        self.trace_only_canvas.set_canvas_size(width, height, self.practice_scale)
-        self.float_trace_canvas.set_canvas_size(width, height, self.practice_scale)
+        for canvas in (self.compare_trace_canvas, self.trace_only_canvas, self.float_trace_canvas):
+            if canvas.isVisible():
+                canvas.set_canvas_size(width, height, self.practice_scale)
         self._ensure_current_drawing_size()
 
     def _reference_only_scale(self) -> int:
@@ -1802,11 +3222,12 @@ class FrameViewerWindow(QMainWindow):
         if history is not None:
             for operation in [*history.undo, *history.redo]:
                 self._resize_drawing_operation(operation, old_size, self.current_drawing_size)
-            self._history_memory.recalculate(self.frame_histories)
-        pending = self._pending_stroke_before.get(self.current_index)
+            self._history_memory.recalculate(self._histories_by_id())
+        frame_id = self.frames[self.current_index].frame_id
+        pending = self._pending_stroke_before.get(frame_id)
         if pending is not None:
             kind, before = pending
-            self._pending_stroke_before[self.current_index] = (kind, self._resized_drawing_image(before))
+            self._pending_stroke_before[frame_id] = (kind, self._resized_drawing_image(before))
 
     @staticmethod
     def _resize_drawing_operation(
@@ -1854,13 +3275,33 @@ class FrameViewerWindow(QMainWindow):
         image.fill(Qt.GlobalColor.transparent)
         return image
 
-    def _load_frame_pixmap(self, index: int) -> QPixmap | None:
-        if index < 0 or index >= len(self.frame_paths):
+    def _load_frame_pixmap(self, frame_id: str) -> QPixmap | None:
+        frame = self._frame_for_id(frame_id)
+        if frame is None:
             return None
-        project_image = self._project_reference_images.get(index)
-        if project_image is not None:
-            return QPixmap.fromImage(project_image)
-        return QPixmap(str(self.frame_paths[index]))
+        if frame.pixmap is not None:
+            return frame.pixmap
+        start = perf_counter()
+        if frame.reference_image is not None:
+            pixmap = QPixmap.fromImage(frame.reference_image)
+        else:
+            pixmap = QPixmap(str(frame.path))
+        if not pixmap.isNull():
+            frame.pixmap = pixmap
+        elapsed_ms = (perf_counter() - start) * 1000
+        if elapsed_ms >= 16.0:
+            print(f"[image-decode] frame_id={frame.frame_id} total={elapsed_ms:.2f}ms")
+        return pixmap
+
+    def _preload_adjacent_frames(self) -> None:
+        """Warm reference pixmaps after timeline input has been idle briefly."""
+
+        if not self.frame_paths:
+            return
+        for offset in (-1, 1):
+            neighbor = self._onion_neighbor_index(self.current_index, offset)
+            if neighbor is not None:
+                self._load_frame_pixmap(self.frames[neighbor].frame_id)
 
     def _playback_interval(self) -> int:
         return max(1, round(1000 / self.playback_fps))
@@ -1877,6 +3318,24 @@ class FrameViewerWindow(QMainWindow):
     def set_export_fps(self, fps: int) -> None:
         fps = max(1, min(60, int(fps)))
         self.export_fps_label.setText(f"{fps} FPS")
+
+    def set_playback_range(self, start: int, end: int) -> None:
+        if not self.frames:
+            self.playback_range_start = 0
+            self.playback_range_end = 0
+            return
+        last = len(self.frames) - 1
+        start = max(0, min(int(start), last))
+        end = max(0, min(int(end), last))
+        if start > end:
+            start, end = end, start
+        self.playback_range_start = start
+        self.playback_range_end = end
+        if hasattr(self, "timeline_ruler"):
+            self.timeline_ruler.update()
+        if self.play_timer.isActive() and not (start <= self.current_index <= end):
+            self._playback_exposure_tick = 0
+            self.set_current_frame(start, update_timeline=True, ensure_visible=True)
 
     def show_previous_frame(self) -> None:
         if not self.frame_paths:
@@ -1898,7 +3357,15 @@ class FrameViewerWindow(QMainWindow):
             self.play_timer.stop()
             return
 
-        index = (self.current_index + 1) % len(self.frame_paths)
+        self._playback_exposure_tick += 1
+        exposure = self.frame_exposures[self.current_index] if self.current_index < len(self.frame_exposures) else 1
+        if self._playback_exposure_tick < exposure:
+            self.play_timer.start(self._playback_interval())
+            return
+        self._playback_exposure_tick = 0
+        start = max(0, min(self.playback_range_start, len(self.frame_paths) - 1))
+        end = max(start, min(self.playback_range_end, len(self.frame_paths) - 1))
+        index = start if self.current_index < start or self.current_index >= end else self.current_index + 1
         if self.set_current_frame(index, update_timeline=True, ensure_visible=True):
             self.play_timer.start(self._playback_interval())
         else:
@@ -1910,9 +3377,13 @@ class FrameViewerWindow(QMainWindow):
 
     def toggle_playback(self, checked: bool) -> None:
         if checked:
+            self._playback_exposure_tick = 0
+            if self.frames and not (self.playback_range_start <= self.current_index <= self.playback_range_end):
+                self.set_current_frame(self.playback_range_start, update_timeline=True, ensure_visible=True)
             self.play_timer.start(self._playback_interval())
         else:
             self.play_timer.stop()
+            self._playback_exposure_tick = 0
         self._set_playback_drawing_blocked(checked)
         self._refresh_onion_skin_visibility()
         self._update_play_icon()
@@ -1990,8 +3461,9 @@ class FrameViewerWindow(QMainWindow):
             | Qt.KeyboardModifier.AltModifier
             | Qt.KeyboardModifier.MetaModifier
         )
-        if self._shortcut_input_is_active() and not (modifiers & Qt.KeyboardModifier.ControlModifier):
-            return False
+        if self._shortcut_input_is_active():
+            if not (modifiers & Qt.KeyboardModifier.ControlModifier):
+                return False
         handler = self._shortcut_handlers.get((modifiers, event.key()))
         if handler is not None:
             handler()
